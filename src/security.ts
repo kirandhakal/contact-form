@@ -29,7 +29,7 @@ export function isAllowedOrigin(origin: string | undefined, allowed: string[]): 
 export function applyCors(reply: FastifyReply, origin?: string): void {
   if (origin) reply.header("Access-Control-Allow-Origin", origin);
   reply.header("Vary", "Origin");
-  reply.header("Access-Control-Allow-Headers", "Content-Type, Idempotency-Key, Authorization");
+  reply.header("Access-Control-Allow-Headers", "Content-Type, Idempotency-Key, Authorization, Turnstile-Token");
   reply.header("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
 }
 

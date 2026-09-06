@@ -27,7 +27,8 @@ const config = {
   WORKER_POLL_MS: 1000,
   SMTP_URL: "",
   EMAIL_FROM: "forms@example.com",
-  WEBHOOK_TIMEOUT_MS: 5000
+  WEBHOOK_TIMEOUT_MS: 5000,
+  TURNSTILE_SECRET_KEY: ""
 };
 
 class MemoryStore implements Store {
@@ -208,5 +209,45 @@ describe("contact form API", () => {
     });
     expect(response.statusCode).toBe(202);
     expect(response.json().status).toBe("spam");
+  });
+
+  it("requires bot verification when Turnstile is configured", async () => {
+    const store = new MemoryStore();
+    const secureConfig = { ...config, TURNSTILE_SECRET_KEY: "test-secret" };
+    const app = buildApp(secureConfig, store);
+    const create = await app.inject({
+      method: "POST",
+      url: "/v1/admin/forms",
+      headers: {
+        authorization: `Bearer ${config.ADMIN_API_KEY}`,
+        "content-type": "application/json"
+      },
+      payload: {
+        tenantName: "Acme",
+        name: "Website contact",
+        allowedOrigins: ["https://www.example.com"],
+        schema: {
+          type: "object",
+          additionalProperties: false,
+          required: ["name", "email", "topic"],
+          properties: {
+            name: { type: "string", minLength: 2 },
+            email: { type: "string", format: "email" },
+            topic: { type: "string", enum: ["sales", "support"] }
+          }
+        }
+      }
+    });
+    const { publicKey } = create.json() as { publicKey: string };
+
+    const response = await app.inject({
+      method: "POST",
+      url: `/v1/forms/${publicKey}/submissions`,
+      headers: { origin: "https://www.example.com" },
+      payload: { name: "Jane", email: "jane@example.com", topic: "support" }
+    });
+
+    expect(response.statusCode).toBe(403);
+    expect(response.json().detail).toBe("Bot verification failed.");
   });
 });

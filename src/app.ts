@@ -35,6 +35,28 @@ function assertPlainObject(value: unknown): value is JsonObject {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+function firstHeader(value: string | string[] | undefined): string | undefined {
+  return Array.isArray(value) ? value[0] : value;
+}
+
+async function verifyTurnstile(secret: string, token: string | undefined, ip: string): Promise<boolean> {
+  if (!secret) return true;
+  if (!token) return false;
+
+  const body = new URLSearchParams({
+    secret,
+    response: token,
+    remoteip: ip
+  });
+  const response = await fetch("https://challenges.cloudflare.com/turnstile/v0/siteverify", {
+    method: "POST",
+    body
+  });
+  if (!response.ok) return false;
+  const result = (await response.json()) as { success?: boolean };
+  return result.success === true;
+}
+
 const createFormAjv = new Ajv2020({ allErrors: true, strict: false });
 addFormats(createFormAjv);
 const validateCreateForm = createFormAjv.compile({
@@ -171,6 +193,11 @@ export function buildApp(config: AppConfig, store: Store) {
     }
     applyCors(reply, request.headers.origin);
 
+    const turnstileToken = firstHeader(request.headers["turnstile-token"]);
+    if (!(await verifyTurnstile(config.TURNSTILE_SECRET_KEY, turnstileToken, request.ip))) {
+      return problem(reply, 403, "Forbidden", "Bot verification failed.");
+    }
+
     const ipHash = hashIp(request.ip, config.DATA_ENCRYPTION_KEY);
     const limited = limiter.check(`${form.publicKey}:${ipHash}`);
     if (!limited.allowed) {
@@ -178,8 +205,7 @@ export function buildApp(config: AppConfig, store: Store) {
       return problem(reply, 429, "Rate limit exceeded", "Too many submissions for this form.");
     }
 
-    const idempotencyHeader = request.headers["idempotency-key"];
-    const idempotencyKey = Array.isArray(idempotencyHeader) ? idempotencyHeader[0] : idempotencyHeader;
+    const idempotencyKey = firstHeader(request.headers["idempotency-key"]);
     if (idempotencyKey && !isValidIdempotencyKey(idempotencyKey)) {
       return problem(reply, 400, "Malformed request", "Invalid idempotency key.");
     }

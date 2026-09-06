@@ -16,7 +16,8 @@ const EnvSchema = z.object({
   WORKER_POLL_MS: z.coerce.number().int().positive().default(1000),
   SMTP_URL: z.string().default(""),
   EMAIL_FROM: z.string().default("forms@example.com"),
-  WEBHOOK_TIMEOUT_MS: z.coerce.number().int().positive().default(5000)
+  WEBHOOK_TIMEOUT_MS: z.coerce.number().int().positive().default(5000),
+  TURNSTILE_SECRET_KEY: z.string().default("")
 });
 
 export type AppConfig = z.infer<typeof EnvSchema>;

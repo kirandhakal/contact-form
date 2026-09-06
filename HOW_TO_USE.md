@@ -29,9 +29,11 @@ ADMIN_API_KEY=replace-with-at-least-24-random-characters
 DATA_ENCRYPTION_KEY=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
 DATABASE_URL=postgres://forms:forms@localhost:5432/forms
 PUBLIC_BASE_URL=http://localhost:3000
+TURNSTILE_SECRET_KEY=
 ```
 
 `ADMIN_API_KEY` is used for admin requests. `DATA_ENCRYPTION_KEY` must be exactly 64 hexadecimal characters.
+Set `TURNSTILE_SECRET_KEY` in production to require Cloudflare Turnstile verification for every submission.
 
 ## 3. Start PostgreSQL
 
@@ -131,6 +133,20 @@ curl -X POST http://localhost:3000/v1/forms/YOUR_PUBLIC_KEY/submissions \
 
 Expected response status is `202 Accepted` for a new submission.
 
+If `TURNSTILE_SECRET_KEY` is set, submissions must also include a valid Turnstile token:
+
+```bash
+curl -X POST http://localhost:3000/v1/forms/YOUR_PUBLIC_KEY/submissions \
+  -H "Origin: http://localhost:8080" \
+  -H "Content-Type: application/json" \
+  -H "Turnstile-Token: TOKEN_FROM_FRONTEND_WIDGET" \
+  -d '{
+    "name": "Test User",
+    "email": "test@example.com",
+    "topic": "support"
+  }'
+```
+
 ## 9. Use The Example HTML Form
 
 Open [examples/contact-form.html](./examples/contact-form.html).
@@ -195,6 +211,14 @@ The browser origin must exactly match one of the values in `allowedOrigins`. For
 ["http://localhost:8080"]
 ```
 
+### Bot verification failed
+
+If `TURNSTILE_SECRET_KEY` is set, your frontend must render a Cloudflare Turnstile widget and send the returned token in this request header:
+
+```text
+Turnstile-Token: TOKEN_FROM_FRONTEND_WIDGET
+```
+
 ### Database not ready
 
 Start PostgreSQL and run migrations:
@@ -203,4 +227,3 @@ Start PostgreSQL and run migrations:
 docker compose up -d postgres
 npm run migrate
 ```
-
