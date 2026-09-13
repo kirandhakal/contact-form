@@ -91,7 +91,7 @@ flowchart TD
 ## 4. Project Structure
 
 ```text
-universal-contact-form-backend/
+contact-backend/
 ├── examples/
 │   └── contact-form.html
 ├── migrations/

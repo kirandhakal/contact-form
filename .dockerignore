@@ -1,0 +1,14 @@
+node_modules
+dist
+coverage
+.git
+.github
+.env
+.env.*
+*.log
+README.md
+UNIVERSAL_CONTACT_FORM_BACKEND.md
+HOW_TO_USE.md
+tests
+examples
+scripts
