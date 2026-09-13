@@ -28,7 +28,7 @@ Open `.env` and set these important values:
 ADMIN_API_KEY=replace-with-at-least-24-random-characters
 DATA_ENCRYPTION_KEY=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
 DATABASE_URL=postgres://forms:forms@localhost:5432/forms
-PUBLIC_BASE_URL=http://localhost:3000
+PUBLIC_BASE_URL=http://localhost:3100
 TURNSTILE_SECRET_KEY=
 ```
 
@@ -56,13 +56,13 @@ npm run dev
 The API runs at:
 
 ```text
-http://localhost:3000
+http://localhost:3100
 ```
 
 Check that it is alive:
 
 ```bash
-curl http://localhost:3000/health/live
+curl http://localhost:3100/health/live
 ```
 
 Expected response:
@@ -88,7 +88,7 @@ The worker sends queued email or webhook deliveries.
 Use the admin API to create a form:
 
 ```bash
-curl -X POST http://localhost:3000/v1/admin/forms \
+curl -X POST http://localhost:3100/v1/admin/forms \
   -H "Authorization: Bearer YOUR_ADMIN_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
@@ -114,12 +114,29 @@ curl -X POST http://localhost:3000/v1/admin/forms \
 
 The response includes a `publicKey` and `submitUrl`. Save the `publicKey`; the frontend uses it to submit messages.
 
+### Register the Gourav inquiry form
+
+The Gourav project is already wired to this backend. Run the API on port `3100`; the existing frontend can remain on `3000` and Gourav runs on `3001`. Register the form once:
+
+```bash
+npm run register:form -- forms/gourav-inquiry.json
+```
+
+Copy the generated public key into `gourav/.env.local`:
+
+```env
+NEXT_PUBLIC_CONTACT_API_URL=http://localhost:3100
+NEXT_PUBLIC_GOURAV_INQUIRY_FORM_KEY=frm_generated_key
+```
+
+Use `gourav/.env.example` as the template. For every additional frontend or form type, create another JSON definition and register it separately. For example, an enrolment form gets its own public key even when it belongs to the same website. This keeps its data and traffic counts separate.
+
 ## 8. Submit A Form
 
 Replace `YOUR_PUBLIC_KEY` with the public key from the previous step:
 
 ```bash
-curl -X POST http://localhost:3000/v1/forms/YOUR_PUBLIC_KEY/submissions \
+curl -X POST http://localhost:3100/v1/forms/YOUR_PUBLIC_KEY/submissions \
   -H "Origin: http://localhost:8080" \
   -H "Content-Type: application/json" \
   -H "Idempotency-Key: test-submit-001" \
@@ -136,7 +153,7 @@ Expected response status is `202 Accepted` for a new submission.
 If `TURNSTILE_SECRET_KEY` is set, submissions must also include a valid Turnstile token:
 
 ```bash
-curl -X POST http://localhost:3000/v1/forms/YOUR_PUBLIC_KEY/submissions \
+curl -X POST http://localhost:3100/v1/forms/YOUR_PUBLIC_KEY/submissions \
   -H "Origin: http://localhost:8080" \
   -H "Content-Type: application/json" \
   -H "Turnstile-Token: TOKEN_FROM_FRONTEND_WIDGET" \
@@ -154,13 +171,13 @@ Open [examples/contact-form.html](./examples/contact-form.html).
 Replace this line:
 
 ```js
-const endpoint = 'http://localhost:3000/v1/forms/REPLACE_PUBLIC_KEY/submissions';
+const endpoint = 'http://localhost:3100/v1/forms/REPLACE_PUBLIC_KEY/submissions';
 ```
 
 with your real form submit URL:
 
 ```js
-const endpoint = 'http://localhost:3000/v1/forms/YOUR_PUBLIC_KEY/submissions';
+const endpoint = 'http://localhost:3100/v1/forms/YOUR_PUBLIC_KEY/submissions';
 ```
 
 Then serve the example file from an allowed origin, for example:
@@ -178,7 +195,16 @@ http://localhost:8080/contact-form.html
 ## 10. View Submissions
 
 ```bash
-curl http://localhost:3000/v1/admin/forms/YOUR_PUBLIC_KEY/submissions \
+curl http://localhost:3100/v1/admin/forms/YOUR_PUBLIC_KEY/submissions \
+  -H "Authorization: Bearer YOUR_ADMIN_API_KEY"
+```
+
+## 11. Compare frontend traffic
+
+Use the admin-only summary endpoint to see which registered form receives the most submissions. It includes total, accepted, spam, last-submitted time, and browser-origin counts without returning the form payloads.
+
+```bash
+curl http://localhost:3100/v1/admin/forms/summary \
   -H "Authorization: Bearer YOUR_ADMIN_API_KEY"
 ```
 

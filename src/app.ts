@@ -185,6 +185,15 @@ export function buildApp(config: AppConfig, store: Store) {
     };
   });
 
+  app.get("/v1/admin/forms/summary", async (request, reply) => {
+    const auth = request.headers.authorization ?? "";
+    const expected = `Bearer ${config.ADMIN_API_KEY}`;
+    if (!constantTimeEqual(auth, expected)) {
+      return problem(reply, 401, "Unauthorized", "Missing or invalid admin token.");
+    }
+    return { forms: await store.listFormSummaries() };
+  });
+
   app.post<{ Params: { publicKey: string } }>("/v1/forms/:publicKey/submissions", async (request, reply) => {
     const form = await store.getActiveForm(request.params.publicKey);
     if (!form) return problem(reply, 404, "Not found", "Form not found or disabled.");

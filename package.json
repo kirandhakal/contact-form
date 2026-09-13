@@ -8,6 +8,7 @@
     "start": "node dist/server.js",
     "worker": "tsx src/worker.ts",
     "migrate": "tsx src/db/migrate.ts",
+    "register:form": "node scripts/register-form.mjs",
     "test": "vitest run",
     "typecheck": "tsc --noEmit",
     "build": "tsc -p tsconfig.build.json"

@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import { buildApp } from "../src/app.js";
 import type {
   CreateFormInput,
+  FormSummary,
   FormRecord,
   JsonObject,
   OutboxJob,
@@ -93,6 +94,31 @@ class MemoryStore implements Store {
   async listSubmissions(publicKey: string, limit: number) {
     const form = this.forms.get(publicKey);
     return form ? this.submissions.filter((item) => item.formId === form.id).slice(0, limit) : [];
+  }
+
+  async listFormSummaries(): Promise<FormSummary[]> {
+    return [...this.forms.values()]
+      .map((form) => {
+        const submissions = this.submissions.filter((item) => item.formId === form.id && item.status !== "deleted");
+        const sourceOriginCounts = submissions.reduce<Record<string, number>>((counts, submission) => {
+          const origin = submission.sourceOrigin ?? "unknown";
+          counts[origin] = (counts[origin] ?? 0) + 1;
+          return counts;
+        }, {});
+        return {
+          tenantName: "Acme",
+          publicKey: form.publicKey,
+          name: form.name,
+          status: form.status,
+          allowedOrigins: form.allowedOrigins,
+          submissionCount: submissions.length,
+          acceptedCount: submissions.filter((item) => item.status === "accepted").length,
+          spamCount: submissions.filter((item) => item.status === "spam").length,
+          lastSubmittedAt: submissions.at(-1)?.createdAt,
+          sourceOriginCounts
+        };
+      })
+      .sort((a, b) => b.submissionCount - a.submissionCount);
   }
 
   async claimJobs(): Promise<OutboxJob[]> {
@@ -209,6 +235,59 @@ describe("contact form API", () => {
     });
     expect(response.statusCode).toBe(202);
     expect(response.json().status).toBe("spam");
+  });
+
+  it("summarizes traffic separately for every form", async () => {
+    const store = new MemoryStore();
+    const { app, body } = await createTestForm(store);
+    const second = await app.inject({
+      method: "POST",
+      url: "/v1/admin/forms",
+      headers: { authorization: `Bearer ${config.ADMIN_API_KEY}` },
+      payload: {
+        tenantName: "Gourav Studio",
+        name: "Gourav inquiry",
+        allowedOrigins: ["https://gourav.example"],
+        schema: { type: "object", additionalProperties: false, properties: {} }
+      }
+    });
+    const secondKey = (second.json() as { publicKey: string }).publicKey;
+
+    await app.inject({
+      method: "POST",
+      url: `/v1/forms/${body.publicKey}/submissions`,
+      headers: { origin: "https://www.example.com" },
+      payload: { name: "Jane", email: "jane@example.com", topic: "support" }
+    });
+    await app.inject({
+      method: "POST",
+      url: `/v1/forms/${body.publicKey}/submissions`,
+      headers: { origin: "https://www.example.com" },
+      payload: { name: "John", email: "john@example.com", topic: "sales" }
+    });
+    await app.inject({
+      method: "POST",
+      url: `/v1/forms/${secondKey}/submissions`,
+      headers: { origin: "https://gourav.example" },
+      payload: {}
+    });
+
+    const summary = await app.inject({
+      method: "GET",
+      url: "/v1/admin/forms/summary",
+      headers: { authorization: `Bearer ${config.ADMIN_API_KEY}` }
+    });
+    expect(summary.statusCode).toBe(200);
+    expect(summary.json().forms).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          publicKey: body.publicKey,
+          submissionCount: 2,
+          sourceOriginCounts: { "https://www.example.com": 2 }
+        }),
+        expect.objectContaining({ publicKey: secondKey, submissionCount: 1 })
+      ])
+    );
   });
 
   it("requires bot verification when Turnstile is configured", async () => {
