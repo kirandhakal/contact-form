@@ -17,6 +17,9 @@ services:
 
   app:
     image: ${IMAGE:-kirandhakal/contact-backend}:${IMAGE_TAG:-latest}
+    build:
+      context: .
+      dockerfile: Dockerfile
     restart: unless-stopped
     env_file:
       - .env.docker
@@ -34,6 +37,9 @@ services:
 
   worker:
     image: ${IMAGE:-kirandhakal/contact-backend}:${IMAGE_TAG:-latest}
+    build:
+      context: .
+      dockerfile: Dockerfile
     restart: unless-stopped
     env_file:
       - .env.docker
