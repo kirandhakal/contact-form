@@ -5,6 +5,14 @@ export function newPublicKey(): string {
   return `frm_${randomBytes(18).toString("base64url")}`;
 }
 
+export function newSubmissionToken(): string {
+  return randomBytes(32).toString("base64url");
+}
+
+export function hashSubmissionToken(token: string, key: string): string {
+  return createHmac("sha256", Buffer.from(key, "hex")).update(token).digest("hex");
+}
+
 export function constantTimeEqual(a: string, b: string): boolean {
   const left = Buffer.from(a);
   const right = Buffer.from(b);
@@ -29,7 +37,7 @@ export function isAllowedOrigin(origin: string | undefined, allowed: string[]): 
 export function applyCors(reply: FastifyReply, origin?: string): void {
   if (origin) reply.header("Access-Control-Allow-Origin", origin);
   reply.header("Vary", "Origin");
-  reply.header("Access-Control-Allow-Headers", "Content-Type, Idempotency-Key, Authorization, Turnstile-Token");
+  reply.header("Access-Control-Allow-Headers", "Content-Type, Idempotency-Key, Authorization, Submission-Token, Turnstile-Token");
   reply.header("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
 }
 

@@ -99,7 +99,9 @@ export interface Store {
     sourceIpHash: string;
     idempotencyKey?: string;
     expiresAt: Date;
+    accessTokenHash?: string;
   }): Promise<SubmissionResult>;
+  getSubmissionByAccessToken(publicKey: string, submissionId: string, accessTokenHash: string): Promise<SubmissionRecord | null>;
   listSubmissions(publicKey: string, limit: number): Promise<SubmissionRecord[]>;
   listFormSummaries(): Promise<FormSummary[]>;
   claimJobs(limit: number): Promise<OutboxJob[]>;

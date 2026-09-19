@@ -35,6 +35,7 @@ const config = {
 class MemoryStore implements Store {
   forms = new Map<string, FormRecord>();
   submissions: SubmissionRecord[] = [];
+  accessTokens = new Map<string, string>();
 
   async ready() {
     return true;
@@ -69,6 +70,7 @@ class MemoryStore implements Store {
     sourceIpHash: string;
     idempotencyKey?: string;
     expiresAt: Date;
+    accessTokenHash?: string;
   }): Promise<SubmissionResult> {
     const existing = args.idempotencyKey
       ? this.submissions.find((item) => item.formId === args.form.id && item.idempotencyKey === args.idempotencyKey)
@@ -88,7 +90,14 @@ class MemoryStore implements Store {
       createdAt: new Date().toISOString()
     };
     this.submissions.push(submission);
+    if (args.accessTokenHash) this.accessTokens.set(submission.id, args.accessTokenHash);
     return { submission, duplicate: false };
+  }
+
+  async getSubmissionByAccessToken(publicKey: string, submissionId: string, accessTokenHash: string) {
+    const form = this.forms.get(publicKey);
+    const submission = this.submissions.find((item) => item.id === submissionId && item.formId === form?.id);
+    return submission && this.accessTokens.get(submission.id) === accessTokenHash ? submission : null;
   }
 
   async listSubmissions(publicKey: string, limit: number) {
@@ -180,6 +189,25 @@ describe("contact form API", () => {
     });
     expect(ok.statusCode).toBe(202);
     expect(ok.json().status).toBe("accepted");
+    expect(ok.json().accessToken).toEqual(expect.any(String));
+
+    const own = await app.inject({
+      method: "GET",
+      url: `/v1/forms/${body.publicKey}/submissions/${ok.json().id}`,
+      headers: {
+        origin: "https://www.example.com",
+        "submission-token": ok.json().accessToken
+      }
+    });
+    expect(own.statusCode).toBe(200);
+    expect(own.json().submission.payload.email).toBe("jane@example.com");
+
+    const denied = await app.inject({
+      method: "GET",
+      url: `/v1/forms/${body.publicKey}/submissions/${ok.json().id}`,
+      headers: { origin: "https://www.example.com", "submission-token": "wrong-token-that-is-long-enough-123456789" }
+    });
+    expect(denied.statusCode).toBe(404);
 
     const blocked = await app.inject({
       method: "POST",

@@ -9,10 +9,12 @@ import {
   applySecurityHeaders,
   constantTimeEqual,
   hashIp,
+  hashSubmissionToken,
   isAllowedOrigin,
   isSafeWebhookUrl,
   isValidIdempotencyKey,
-  newPublicKey
+  newPublicKey,
+  newSubmissionToken
 } from "./security.js";
 import type { CreateFormInput, JsonObject, Store } from "./types.js";
 
@@ -234,6 +236,7 @@ export function buildApp(config: AppConfig, store: Store) {
     }
 
     const expiresAt = new Date(Date.now() + config.RETENTION_DAYS * 24 * 60 * 60 * 1000);
+    const accessToken = spam ? undefined : newSubmissionToken();
     const result = await store.createSubmission({
       form,
       payload,
@@ -241,15 +244,48 @@ export function buildApp(config: AppConfig, store: Store) {
       sourceOrigin: request.headers.origin,
       sourceIpHash: ipHash,
       idempotencyKey,
-      expiresAt
+      expiresAt,
+      accessTokenHash: accessToken ? hashSubmissionToken(accessToken, config.DATA_ENCRYPTION_KEY) : undefined
     });
     return reply.code(result.duplicate ? 200 : 202).send({
       id: result.submission.id,
       status: result.submission.status,
       duplicate: result.duplicate,
-      message: form.successMessage
+      message: form.successMessage,
+      ...(result.duplicate || !accessToken ? {} : { accessToken })
     });
   });
+
+  app.get<{ Params: { publicKey: string; submissionId: string } }>(
+    "/v1/forms/:publicKey/submissions/:submissionId",
+    async (request, reply) => {
+      const form = await store.getActiveForm(request.params.publicKey);
+      if (!form) return problem(reply, 404, "Not found", "Form not found or disabled.");
+      if (!isAllowedOrigin(request.headers.origin, form.allowedOrigins)) {
+        return problem(reply, 403, "Forbidden", "Origin is not allowed for this form.");
+      }
+      applyCors(reply, request.headers.origin);
+      const token = firstHeader(request.headers["submission-token"]);
+      if (!token || token.length < 32 || token.length > 128) {
+        return problem(reply, 401, "Unauthorized", "A valid submission token is required.");
+      }
+      const submission = await store.getSubmissionByAccessToken(
+        request.params.publicKey,
+        request.params.submissionId,
+        hashSubmissionToken(token, config.DATA_ENCRYPTION_KEY)
+      );
+      if (!submission) return problem(reply, 404, "Not found", "Submission not found or access has expired.");
+      return {
+        submission: {
+          id: submission.id,
+          payload: submission.payload,
+          status: submission.status,
+          createdAt: submission.createdAt,
+          expiresAt: submission.expiresAt
+        }
+      };
+    }
+  );
 
   app.get<{ Params: { publicKey: string }; Querystring: { limit?: string } }>(
     "/v1/admin/forms/:publicKey/submissions",

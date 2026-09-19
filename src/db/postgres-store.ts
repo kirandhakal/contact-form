@@ -134,6 +134,7 @@ export class PostgresStore implements Store {
     sourceIpHash: string;
     idempotencyKey?: string;
     expiresAt: Date;
+    accessTokenHash?: string;
   }): Promise<SubmissionResult> {
     const client = await this.pool.connect();
     try {
@@ -150,8 +151,8 @@ export class PostgresStore implements Store {
       }
 
       const inserted = await client.query(
-        `insert into submissions(tenant_id, form_id, form_version, payload, status, source_origin, source_ip_hash, idempotency_key, expires_at)
-         values($1, $2, $3, $4, $5, $6, $7, $8, $9)
+        `insert into submissions(tenant_id, form_id, form_version, payload, status, source_origin, source_ip_hash, idempotency_key, expires_at, access_token_hash)
+         values($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
          returning *`,
         [
           args.form.tenantId,
@@ -162,7 +163,8 @@ export class PostgresStore implements Store {
           args.sourceOrigin ?? null,
           args.sourceIpHash,
           args.idempotencyKey ?? null,
-          args.expiresAt
+          args.expiresAt,
+          args.accessTokenHash ?? null
         ]
       );
       if (args.status === "accepted") {
@@ -180,6 +182,18 @@ export class PostgresStore implements Store {
     } finally {
       client.release();
     }
+  }
+
+  async getSubmissionByAccessToken(publicKey: string, submissionId: string, accessTokenHash: string): Promise<SubmissionRecord | null> {
+    const result = await this.pool.query(
+      `select s.*
+       from submissions s
+       join forms f on f.id = s.form_id
+       where f.public_key = $1 and s.id = $2 and s.access_token_hash = $3
+         and s.status = 'accepted' and s.expires_at > now()`,
+      [publicKey, submissionId, accessTokenHash]
+    );
+    return result.rowCount ? mapSubmission(result.rows[0]) : null;
   }
 
   async listSubmissions(publicKey: string, limit: number): Promise<SubmissionRecord[]> {
