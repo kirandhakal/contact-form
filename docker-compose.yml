@@ -1,35 +1,25 @@
 services:
-  postgres:
-    image: postgres:17-alpine
-    environment:
-      POSTGRES_USER: forms
-      POSTGRES_PASSWORD: forms
-      POSTGRES_DB: forms
-    ports:
-      - "127.0.0.1:5432:5432"
-    volumes:
-      - postgres-data:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U forms -d forms"]
-      interval: 5s
-      timeout: 5s
-      retries: 10
-
   app:
     image: ${IMAGE:-kirandhakal/contact-backend}:${IMAGE_TAG:-latest}
-    build:
-      context: .
-      dockerfile: Dockerfile
     restart: unless-stopped
+
     env_file:
       - .env.docker
+
     ports:
       - "${APP_PORT:-3100}:3100"
-    depends_on:
-      postgres:
-        condition: service_healthy
+
+    networks:
+      - shared-postgres
+
     healthcheck:
-      test: ["CMD", "node", "-e", "require('http').get('http://127.0.0.1:3100/health/live', r => process.exit(r.statusCode === 200 ? 0 : 1)).on('error', () => process.exit(1))"]
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "require('http').get('http://127.0.0.1:3100/health/live', r => process.exit(r.statusCode === 200 ? 0 : 1)).on('error', () => process.exit(1))"
+        ]
       interval: 10s
       timeout: 5s
       retries: 12
@@ -37,16 +27,17 @@ services:
 
   worker:
     image: ${IMAGE:-kirandhakal/contact-backend}:${IMAGE_TAG:-latest}
-    build:
-      context: .
-      dockerfile: Dockerfile
     restart: unless-stopped
+
     env_file:
       - .env.docker
-    command: ["node", "dist/worker.js"]
-    depends_on:
-      postgres:
-        condition: service_healthy
 
-volumes:
-  postgres-data:
+    command: ["node", "dist/worker.js"]
+
+    networks:
+      - shared-postgres
+
+networks:
+  shared-postgres:
+    external: true
+    name: pandanestbacked_pandanest-network
