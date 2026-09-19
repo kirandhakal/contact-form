@@ -1,0 +1,150 @@
+name: CI/CD
+
+on:
+  push:
+    branches: [main]
+ 
+  workflow_dispatch:
+
+concurrency:
+  group: production-deploy
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  IMAGE: kirandhakal/contact-backend
+  DEPLOY_PATH: /var/www/contact-backend
+
+jobs:
+  test:
+    name: Test and build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - name: Install dependencies
+        run: npm ci
+      - name: Run tests
+        run: npm test
+      - name: Typecheck
+        run: npm run typecheck
+      - name: Build application
+        run: npm run build
+
+  build-and-push:
+    name: Build and push Docker image
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    needs: test
+    outputs:
+      image_tag: ${{ github.sha }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: |
+            ${{ env.IMAGE }}:latest
+            ${{ env.IMAGE }}:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: false
+      - name: Verify image exists
+        run: docker buildx imagetools inspect "${{ env.IMAGE }}:${{ github.sha }}"
+
+  deploy:
+    name: Deploy to production
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Upload Docker Compose configuration
+        uses: appleboy/scp-action@v1.0.0
+        with:
+          host: ${{ secrets.HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          source: docker-compose.yml
+          target: ${{ env.DEPLOY_PATH }}
+      - name: Pull image and restart application
+        uses: appleboy/ssh-action@v1.2.0
+        env:
+          IMAGE: ${{ env.IMAGE }}
+          IMAGE_TAG: ${{ github.sha }}
+          DEPLOY_PATH: ${{ env.DEPLOY_PATH }}
+        with:
+          host: ${{ secrets.HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          command_timeout: 30m
+          envs: IMAGE,IMAGE_TAG,DEPLOY_PATH
+          script_stop: false
+          script: |
+            set -euxo pipefail
+            test -d "$DEPLOY_PATH"
+            cd "$DEPLOY_PATH"
+            test -f .env.docker
+            sudo -n docker info >/dev/null
+            sudo -n docker compose version
+            export IMAGE IMAGE_TAG
+            sudo -n docker compose --env-file .env.docker config >/dev/null
+            sudo -n docker compose --env-file .env.docker pull app worker
+            sudo -n docker compose --env-file .env.docker up -d postgres
+            sudo -n docker compose --env-file .env.docker run --rm app node dist/db/migrate.js
+            sudo -n docker compose --env-file .env.docker up -d --force-recreate app worker
+
+            HEALTHY=0
+            for i in $(seq 1 20); do
+              if sudo -n docker compose --env-file .env.docker exec -T app node -e "require('http').get('http://127.0.0.1:3100/health/ready', r => process.exit(r.statusCode === 200 ? 0 : 1)).on('error', () => process.exit(1))"; then
+                HEALTHY=1
+                echo "Health check passed on attempt $i"
+                break
+              fi
+              echo "Attempt $i/20 not healthy yet, waiting 3s..."
+              sleep 3
+            done
+            if [ "$HEALTHY" -ne 1 ]; then
+              sudo -n docker compose --env-file .env.docker logs --tail=100 app worker postgres
+              exit 1
+            fi
+            sudo -n docker image prune -f
+            sudo -n docker compose --env-file .env.docker ps
+      - name: Notify Discord
+        if: always()
+        run: |
+          if [ "${{ job.status }}" = "success" ]; then
+            STATUS="✅ Deployment succeeded"
+            COLOR=3066993
+          else
+            STATUS="❌ Deployment failed"
+            COLOR=15158332
+          fi
+          curl -sf -H "Content-Type: application/json" \
+            -d '{
+              "embeds": [{
+                "title": "'"${STATUS}"'",
+                "description": "**Repo:** ${{ github.repository }}\n**Branch:** ${{ github.ref_name }}\n**Commit:** [`${{ github.sha }}`](${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }})\n**Triggered by:** ${{ github.actor }}\n**Run:** [View logs](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})",
+                "color": '"${COLOR}"'
+              }]
+            }' \
+            "${{ secrets.DISCORD_WEBHOOK_URL }}"

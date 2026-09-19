@@ -1,0 +1,18 @@
+{
+  "tenantName": "Gourav Studio",
+  "name": "Gourav Studio inquiry",
+  "allowedOrigins": ["http://localhost:3001"],
+  "successMessage": "Thanks — your inquiry has been received.",
+  "honeypotField": "_website",
+  "schema": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": ["name", "email", "vision"],
+    "properties": {
+      "name": { "type": "string", "minLength": 2, "maxLength": 100 },
+      "email": { "type": "string", "format": "email", "maxLength": 254 },
+      "vision": { "type": "string", "minLength": 10, "maxLength": 3000 }
+    }
+  },
+  "destinations": []
+}

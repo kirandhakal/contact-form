@@ -1,5 +1,5 @@
 {
-  "name": "universal-contact-form-backend",
+  "name": "contact-backend",
   "version": "0.1.0",
   "private": true,
   "type": "module",
@@ -8,6 +8,12 @@
     "start": "node dist/server.js",
     "worker": "tsx src/worker.ts",
     "migrate": "tsx src/db/migrate.ts",
+    "docker:up": "docker compose --env-file .env.docker up -d --build",
+    "docker:migrate": "docker compose --env-file .env.docker run --rm app node dist/db/migrate.js",
+    "docker:logs": "docker compose --env-file .env.docker logs -f app worker",
+    "docker:down": "docker compose --env-file .env.docker down",
+    "docker:local": "bash scripts/docker-local.sh",
+    "register:form": "node scripts/register-form.mjs",
     "test": "vitest run",
     "typecheck": "tsc --noEmit",
     "build": "tsc -p tsconfig.build.json"

@@ -2,6 +2,7 @@ import pg from "pg";
 import type {
   CreateFormInput,
   DestinationRecord,
+  FormSummary,
   FormRecord,
   JsonObject,
   OutboxJob,
@@ -192,6 +193,58 @@ export class PostgresStore implements Store {
       [publicKey, limit]
     );
     return result.rows.map(mapSubmission);
+  }
+
+  async listFormSummaries(): Promise<FormSummary[]> {
+    const result = await this.pool.query(
+      `select
+         t.name as tenant_name,
+         f.public_key,
+         f.name,
+         f.status,
+         f.allowed_origins,
+         totals.submission_count,
+         totals.accepted_count,
+         totals.spam_count,
+         totals.last_submitted_at,
+         origins.source_origin_counts
+       from forms f
+       join tenants t on t.id = f.tenant_id
+       left join lateral (
+         select
+           count(*)::int as submission_count,
+           count(*) filter (where status = 'accepted')::int as accepted_count,
+           count(*) filter (where status = 'spam')::int as spam_count,
+           max(created_at) as last_submitted_at
+         from submissions
+         where form_id = f.id and status <> 'deleted'
+       ) totals on true
+       left join lateral (
+         select coalesce(jsonb_object_agg(origin, submission_count), '{}'::jsonb) as source_origin_counts
+         from (
+           select coalesce(source_origin, 'unknown') as origin, count(*)::int as submission_count
+           from submissions
+           where form_id = f.id and status <> 'deleted'
+           group by coalesce(source_origin, 'unknown')
+         ) grouped_origins
+       ) origins on true
+       order by totals.submission_count desc, totals.last_submitted_at desc nulls last, f.created_at desc`
+    );
+    return result.rows.map((row) => ({
+      tenantName: row.tenant_name,
+      publicKey: row.public_key,
+      name: row.name,
+      status: row.status,
+      allowedOrigins: row.allowed_origins,
+      submissionCount: Number(row.submission_count),
+      acceptedCount: Number(row.accepted_count),
+      spamCount: Number(row.spam_count),
+      lastSubmittedAt:
+        row.last_submitted_at instanceof Date
+          ? row.last_submitted_at.toISOString()
+          : row.last_submitted_at ?? undefined,
+      sourceOriginCounts: row.source_origin_counts ?? {}
+    }));
   }
 
   async claimJobs(limit: number): Promise<OutboxJob[]> {

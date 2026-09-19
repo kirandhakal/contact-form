@@ -61,6 +61,24 @@ export interface SubmissionResult {
   duplicate: boolean;
 }
 
+/**
+ * Admin-only counts used to compare traffic between independent frontends.
+ * A form has one public key, so its counts and submissions are isolated from
+ * every other frontend or form type (for example, contact vs. enrolment).
+ */
+export interface FormSummary {
+  tenantName: string;
+  publicKey: string;
+  name: string;
+  status: "active" | "disabled";
+  allowedOrigins: string[];
+  submissionCount: number;
+  acceptedCount: number;
+  spamCount: number;
+  lastSubmittedAt?: string;
+  sourceOriginCounts: Record<string, number>;
+}
+
 export interface OutboxJob {
   id: string;
   submission: SubmissionRecord;
@@ -83,6 +101,7 @@ export interface Store {
     expiresAt: Date;
   }): Promise<SubmissionResult>;
   listSubmissions(publicKey: string, limit: number): Promise<SubmissionRecord[]>;
+  listFormSummaries(): Promise<FormSummary[]>;
   claimJobs(limit: number): Promise<OutboxJob[]>;
   markJobDelivered(id: string): Promise<void>;
   markJobFailed(id: string, attempts: number, error: string): Promise<void>;

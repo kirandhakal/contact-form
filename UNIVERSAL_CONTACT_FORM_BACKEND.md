@@ -91,7 +91,7 @@ flowchart TD
 ## 4. Project Structure
 
 ```text
-universal-contact-form-backend/
+contact-backend/
 ├── examples/
 │   └── contact-form.html
 ├── migrations/
@@ -207,6 +207,7 @@ Existing submissions retain the form-version number used during validation.
 | `GET` | `/health/live` | Public | Process health |
 | `GET` | `/health/ready` | Public | Database readiness |
 | `POST` | `/v1/admin/forms` | Admin bearer key | Create tenant and form |
+| `GET` | `/v1/admin/forms/summary` | Admin bearer key | Compare counts for all forms/frontends |
 | `GET` | `/v1/forms/:publicKey` | Allowed origin | Retrieve public schema |
 | `POST` | `/v1/forms/:publicKey/submissions` | Allowed origin | Submit form data |
 | `GET` | `/v1/admin/forms/:publicKey/submissions` | Admin bearer key | List recent submissions |
@@ -216,11 +217,11 @@ Existing submissions retain the form-version number used during validation.
 ```env
 NODE_ENV=development
 HOST=0.0.0.0
-PORT=3000
+PORT=3100
 DATABASE_URL=postgres://forms:forms@localhost:5432/forms
 ADMIN_API_KEY=replace-with-at-least-24-random-characters
 DATA_ENCRYPTION_KEY=replace-with-64-hex-characters
-PUBLIC_BASE_URL=http://localhost:3000
+PUBLIC_BASE_URL=http://localhost:3100
 MAX_BODY_BYTES=65536
 RATE_LIMIT_WINDOW_SECONDS=60
 RATE_LIMIT_MAX=20
@@ -270,13 +271,13 @@ npm run worker
 Default API address:
 
 ```text
-http://localhost:3000
+http://localhost:3100
 ```
 
 ## 10. Create a Form
 
 ```bash
-curl -X POST http://localhost:3000/v1/admin/forms \
+curl -X POST http://localhost:3100/v1/admin/forms \
   -H 'Authorization: Bearer YOUR_ADMIN_API_KEY' \
   -H 'Content-Type: application/json' \
   -d '{
@@ -337,7 +338,7 @@ Example response:
 {
   "id": "019...",
   "publicKey": "frm_...",
-  "submitUrl": "http://localhost:3000/v1/forms/frm_.../submissions"
+  "submitUrl": "http://localhost:3100/v1/forms/frm_.../submissions"
 }
 ```
 
