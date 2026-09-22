@@ -12,6 +12,7 @@ export interface DestinationInput {
 
 export interface CreateFormInput {
   tenantName: string;
+  tenantId?: string;
   name: string;
   allowedOrigins: string[];
   successMessage?: string;
@@ -67,6 +68,7 @@ export interface SubmissionResult {
  * every other frontend or form type (for example, contact vs. enrolment).
  */
 export interface FormSummary {
+  tenantId: string;
   tenantName: string;
   publicKey: string;
   name: string;
@@ -99,9 +101,14 @@ export interface Store {
     sourceIpHash: string;
     idempotencyKey?: string;
     expiresAt: Date;
-    accessTokenHash?: string;
   }): Promise<SubmissionResult>;
-  getSubmissionByAccessToken(publicKey: string, submissionId: string, accessTokenHash: string): Promise<SubmissionRecord | null>;
+  createAdmin(email: string, passwordHash: string, role: "service" | "site", tenantId: string | null): Promise<void>;
+  getAdminByEmail(email: string): Promise<{ id: string; email: string; passwordHash: string; role: "service" | "site"; tenantId: string | null } | null>;
+  createAdminSession(adminId: string, tokenHash: string, expiresAt: Date): Promise<void>;
+  getAdminBySession(tokenHash: string): Promise<{ id: string; email: string; role: "service" | "site"; tenantId: string | null } | null>;
+  deleteAdminSession(tokenHash: string): Promise<void>;
+  getTenantIdForForm(publicKey: string): Promise<string | null>;
+  setFormStatus(publicKey: string, status: "active" | "disabled"): Promise<boolean>;
   listSubmissions(publicKey: string, limit: number): Promise<SubmissionRecord[]>;
   listFormSummaries(): Promise<FormSummary[]>;
   claimJobs(limit: number): Promise<OutboxJob[]>;

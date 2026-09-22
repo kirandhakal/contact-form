@@ -35,7 +35,25 @@ const config = {
 class MemoryStore implements Store {
   forms = new Map<string, FormRecord>();
   submissions: SubmissionRecord[] = [];
-  accessTokens = new Map<string, string>();
+  admins = new Map<string, { id: string; email: string; passwordHash: string; role: "service" | "site"; tenantId: string | null }>();
+  sessions = new Map<string, string>();
+
+  async createAdmin(email: string, passwordHash: string, role: "service" | "site", tenantId: string | null) {
+    this.admins.set(email, { id: randomUUID(), email, passwordHash, role, tenantId });
+  }
+  async getAdminByEmail(email: string) { return this.admins.get(email) ?? null; }
+  async createAdminSession(adminId: string, tokenHash: string) { this.sessions.set(tokenHash, adminId); }
+  async getAdminBySession(tokenHash: string) {
+    return [...this.admins.values()].find((admin) => admin.id === this.sessions.get(tokenHash)) ?? null;
+  }
+  async deleteAdminSession(tokenHash: string) { this.sessions.delete(tokenHash); }
+  async getTenantIdForForm(publicKey: string) { return this.forms.get(publicKey)?.tenantId ?? null; }
+  async setFormStatus(publicKey: string, status: "active" | "disabled") {
+    const form = this.forms.get(publicKey);
+    if (!form) return false;
+    form.status = status;
+    return true;
+  }
 
   async ready() {
     return true;
@@ -44,7 +62,7 @@ class MemoryStore implements Store {
   async createForm(input: CreateFormInput, publicKey: string): Promise<FormRecord> {
     const form: FormRecord = {
       id: randomUUID(),
-      tenantId: randomUUID(),
+      tenantId: input.tenantId ?? randomUUID(),
       publicKey,
       name: input.name,
       status: "active",
@@ -70,7 +88,6 @@ class MemoryStore implements Store {
     sourceIpHash: string;
     idempotencyKey?: string;
     expiresAt: Date;
-    accessTokenHash?: string;
   }): Promise<SubmissionResult> {
     const existing = args.idempotencyKey
       ? this.submissions.find((item) => item.formId === args.form.id && item.idempotencyKey === args.idempotencyKey)
@@ -90,14 +107,7 @@ class MemoryStore implements Store {
       createdAt: new Date().toISOString()
     };
     this.submissions.push(submission);
-    if (args.accessTokenHash) this.accessTokens.set(submission.id, args.accessTokenHash);
     return { submission, duplicate: false };
-  }
-
-  async getSubmissionByAccessToken(publicKey: string, submissionId: string, accessTokenHash: string) {
-    const form = this.forms.get(publicKey);
-    const submission = this.submissions.find((item) => item.id === submissionId && item.formId === form?.id);
-    return submission && this.accessTokens.get(submission.id) === accessTokenHash ? submission : null;
   }
 
   async listSubmissions(publicKey: string, limit: number) {
@@ -115,6 +125,7 @@ class MemoryStore implements Store {
           return counts;
         }, {});
         return {
+          tenantId: form.tenantId,
           tenantName: "Acme",
           publicKey: form.publicKey,
           name: form.name,
@@ -173,6 +184,45 @@ async function createTestForm(store: MemoryStore) {
 }
 
 describe("contact form API", () => {
+  it("limits a site admin to their own tenant", async () => {
+    const store = new MemoryStore();
+    const { app, body } = await createTestForm(store);
+    const other = await app.inject({
+      method: "POST", url: "/v1/admin/forms",
+      headers: { authorization: `Bearer ${config.ADMIN_API_KEY}` },
+      payload: { tenantName: "Other", name: "Other form", allowedOrigins: ["https://other.example"],
+        schema: { type: "object", additionalProperties: false, properties: {} } }
+    });
+    const otherKey = (other.json() as { publicKey: string }).publicKey;
+    const created = await app.inject({
+      method: "POST", url: "/v1/admin/users",
+      headers: { authorization: `Bearer ${config.ADMIN_API_KEY}` },
+      payload: { email: "owner@example.com", password: "a-long-secret-password", role: "site", formKey: body.publicKey }
+    });
+    expect(created.statusCode).toBe(201);
+    const login = await app.inject({
+      method: "POST", url: "/v1/admin/login", headers: { origin: config.PUBLIC_BASE_URL },
+      payload: { email: "owner@example.com", password: "a-long-secret-password" }
+    });
+    expect(login.statusCode).toBe(200);
+    const cookie = login.headers["set-cookie"] as string;
+    const own = await app.inject({ method: "GET", url: "/v1/admin/forms/summary", headers: { cookie } });
+    expect(own.json().forms.map((form: FormSummary) => form.publicKey)).toEqual([body.publicKey]);
+    const forbidden = await app.inject({ method: "GET", url: `/v1/admin/forms/${otherKey}/submissions`, headers: { cookie } });
+    expect(forbidden.statusCode).toBe(404);
+    const cannotDisableOther = await app.inject({
+      method: "PATCH", url: `/v1/admin/forms/${otherKey}`,
+      headers: { cookie, origin: config.PUBLIC_BASE_URL }, payload: { status: "disabled" }
+    });
+    expect(cannotDisableOther.statusCode).toBe(404);
+    const disableOwn = await app.inject({
+      method: "PATCH", url: `/v1/admin/forms/${body.publicKey}`,
+      headers: { cookie, origin: config.PUBLIC_BASE_URL }, payload: { status: "disabled" }
+    });
+    expect(disableOwn.statusCode).toBe(200);
+    const allowed = await app.inject({ method: "GET", url: `/v1/admin/forms/${body.publicKey}/submissions`, headers: { cookie } });
+    expect(allowed.statusCode).toBe(200);
+  });
   it("creates a form through the admin endpoint", async () => {
     const { body } = await createTestForm(new MemoryStore());
     expect(body.publicKey).toMatch(/^frm_/);
@@ -189,25 +239,7 @@ describe("contact form API", () => {
     });
     expect(ok.statusCode).toBe(202);
     expect(ok.json().status).toBe("accepted");
-    expect(ok.json().accessToken).toEqual(expect.any(String));
-
-    const own = await app.inject({
-      method: "GET",
-      url: `/v1/forms/${body.publicKey}/submissions/${ok.json().id}`,
-      headers: {
-        origin: "https://www.example.com",
-        "submission-token": ok.json().accessToken
-      }
-    });
-    expect(own.statusCode).toBe(200);
-    expect(own.json().submission.payload.email).toBe("jane@example.com");
-
-    const denied = await app.inject({
-      method: "GET",
-      url: `/v1/forms/${body.publicKey}/submissions/${ok.json().id}`,
-      headers: { origin: "https://www.example.com", "submission-token": "wrong-token-that-is-long-enough-123456789" }
-    });
-    expect(denied.statusCode).toBe(404);
+    expect(ok.json()).toEqual({ status: "accepted", message: "Thank you. We received your message." });
 
     const blocked = await app.inject({
       method: "POST",
@@ -243,7 +275,7 @@ describe("contact form API", () => {
     expect((await app.inject(request)).statusCode).toBe(202);
     const duplicate = await app.inject(request);
     expect(duplicate.statusCode).toBe(200);
-    expect(duplicate.json().duplicate).toBe(true);
+    expect(duplicate.json().status).toBe("accepted");
     expect(store.submissions).toHaveLength(1);
   });
 

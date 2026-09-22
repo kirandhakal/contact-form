@@ -192,33 +192,43 @@ Open:
 http://localhost:8080/contact-form.html
 ```
 
-## 10. View Submissions
+## 10. Admin accounts and dashboard
+
+Run `npm run migrate` after updating an existing installation. The contact service hosts the admin dashboard at the origin in `PUBLIC_BASE_URL`, followed by `/admin` (for example, `http://localhost:3100/admin`). Use the exact same host name as `PUBLIC_BASE_URL` when signing in.
+
+The backend operator's `ADMIN_API_KEY` is a bootstrap credential. Keep it on the contact server. Create the first service admin with it:
+
+```bash
+curl -X POST http://localhost:3100/v1/admin/users \
+  -H "Authorization: Bearer YOUR_ADMIN_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"email":"operator@example.com","password":"a-unique-password-at-least-12-chars","role":"service"}'
+```
+
+The service admin can sign in at `/admin`, see every form, and create site admins. To create a site admin from the API, use any registered form key for that site:
+
+```bash
+curl -X POST http://localhost:3100/v1/admin/users \
+  -H "Authorization: Bearer YOUR_ADMIN_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"email":"site-owner@example.com","password":"a-different-long-password","role":"site","formKey":"YOUR_PUBLIC_KEY"}'
+```
+
+Site admins sign in at the same `/admin` page. They see submissions and counts for forms in their tenant only, and can add other site admins for that tenant. Give each site admin an individual account. A public form key is safe to include in a static frontend; admin passwords and `ADMIN_API_KEY` are not.
+
+To add another form for an existing site, pass its `tenantId` in the form creation request along with the usual form fields. The service admin can find the tenant ID in `/v1/admin/forms/summary`. Forms with the same `tenantId` appear together for that site's admins. Omit `tenantId` to create a new site tenant.
+
+The dashboard is hosted on the contact service origin and uses an HttpOnly, SameSite=Strict session cookie. Login is rate limited. Sessions expire after 8 hours and can be ended with Sign out. Use HTTPS for production.
+Admins can view recent submissions and enable or disable their own forms from the dashboard. Service admins can manage all forms.
+
+## 11. Admin API
 
 ```bash
 curl http://localhost:3100/v1/admin/forms/YOUR_PUBLIC_KEY/submissions \
   -H "Authorization: Bearer YOUR_ADMIN_API_KEY"
 ```
 
-### Let a frontend user view their own submission
-
-Each accepted browser submission returns an opaque `accessToken` together with its `id`:
-
-```json
-{
-  "id": "submission-uuid",
-  "accessToken": "private-receipt-token"
-}
-```
-
-The frontend must keep that token private (for example, in `sessionStorage`) and send it when viewing that exact submission:
-
-```bash
-curl "http://localhost:3100/v1/forms/YOUR_PUBLIC_KEY/submissions/SUBMISSION_ID" \
-  -H "Origin: http://localhost:3000" \
-  -H "Submission-Token: PRIVATE_RECEIPT_TOKEN"
-```
-
-The backend stores only a hash of the token. The token is scoped to one submission, expires with the submission retention period, and cannot list other submissions. Spam submissions do not receive a token. The React contact form already uses this flow through its `View My Submission` button.
+Public submissions return only a status and confirmation message. The visitor does not get a read credential. The static site can display its own success message instead of the API message.
 
 ## 11. Compare frontend traffic
 

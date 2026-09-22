@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Contact forms admin</title>
+  <style>
+    body{font:16px system-ui,sans-serif;background:#f5f7fb;color:#16233b;margin:0}main{max-width:950px;margin:40px auto;padding:0 20px}h1{font-size:2rem}form,.panel{background:white;border:1px solid #dde4ee;border-radius:14px;padding:22px;margin:18px 0}input,select,button{font:inherit;padding:10px;border:1px solid #b8c5d8;border-radius:8px;margin:5px 0}input{width:min(100%,350px);box-sizing:border-box;display:block}button{background:#143e83;color:white;cursor:pointer}button:disabled{opacity:.5}header{display:flex;justify-content:space-between;align-items:center;gap:12px}header button{background:#48566d}.form{display:flex;justify-content:space-between;align-items:center;gap:12px;border-top:1px solid #e3e8ef;padding:12px 0}.muted{color:#576779}.error{color:#a02020}.item{border-top:1px solid #e3e8ef;padding:16px 0;white-space:pre-wrap;overflow-wrap:anywhere}pre{font:inherit;white-space:pre-wrap;overflow-wrap:anywhere}label{display:block;margin-top:12px;font-weight:600}
+  </style>
+</head>
+<body><main>
+  <header><h1>Contact forms</h1><button id="logout" hidden>Sign out</button></header>
+  <p id="message" role="status"></p>
+  <form id="login"><h2>Admin sign in</h2><label>Email<input name="email" type="email" autocomplete="username" required></label><label>Password<input name="password" type="password" autocomplete="current-password" required></label><button>Sign in</button></form>
+  <section id="dashboard" hidden><p id="identity" class="muted"></p><div class="panel"><h2>Forms</h2><div id="forms"></div></div><div class="panel"><h2 id="submissions-title">Submissions</h2><div id="submissions" class="muted">Choose a form.</div></div><form id="add-user"><h2>Add a site admin</h2><p class="muted">A site admin can view all forms that belong to the same site.</p><label>Email<input name="email" type="email" required></label><label>Temporary password<input name="password" type="password" minlength="12" required></label><label id="form-key-label">Form key<input name="formKey"></label><button>Add admin</button></form></section>
+</main><script>
+const $=id=>document.getElementById(id);
+const message=(text,bad=false)=>{ $('message').textContent=text; $('message').className=bad?'error':''; };
+async function api(path,options={}){const response=await fetch(path,{...options,headers:{'Content-Type':'application/json',...(options.headers||{})}});const body=await response.json();if(!response.ok)throw Error(body.detail||body.title||'Request failed');return body;}
+async function load(){
+  try{
+    const me=await api('/v1/admin/me');
+    $('login').hidden=true;$('dashboard').hidden=false;$('logout').hidden=false;
+    $('identity').textContent=me.email+' · '+(me.role==='service'?'Service admin':'Site admin');
+    $('form-key-label').hidden=me.role==='site';
+    const data=await api('/v1/admin/forms/summary');
+    const list=$('forms');list.replaceChildren();
+    for(const form of data.forms){
+      const row=document.createElement('div');row.className='form';
+      const details=document.createElement('div');
+      const title=document.createElement('strong');title.textContent=form.name;
+      const count=document.createElement('div');count.className='muted';
+      count.textContent=form.tenantName+' · '+form.acceptedCount+' accepted · '+form.spamCount+' spam · '+form.status;
+      details.append(title,count);
+      if(me.role==='service'){
+        const keys=document.createElement('small');keys.className='muted';
+        keys.textContent='Form: '+form.publicKey+' · Tenant: '+form.tenantId;
+        details.append(document.createElement('br'),keys);
+      }
+      const actions=document.createElement('div');
+      const view=document.createElement('button');view.textContent='View';view.onclick=()=>showSubmissions(form);
+      const toggle=document.createElement('button');toggle.textContent=form.status==='active'?'Disable':'Enable';
+      toggle.onclick=()=>setStatus(form);
+      actions.append(view,toggle);row.append(details,actions);list.append(row);
+    }
+    if(!data.forms.length)list.textContent='No forms yet.';
+  }catch(error){$('login').hidden=false;$('dashboard').hidden=true;$('logout').hidden=true;}
+}
+async function showSubmissions(form){$('submissions-title').textContent=form.name+' submissions';$('submissions').textContent='Loading…';try{const data=await api('/v1/admin/forms/'+encodeURIComponent(form.publicKey)+'/submissions?limit=200');const area=$('submissions');area.replaceChildren();for(const entry of data.submissions){const item=document.createElement('div');item.className='item';const heading=document.createElement('strong');heading.textContent=new Date(entry.createdAt).toLocaleString()+' · '+entry.status;const payload=document.createElement('pre');payload.textContent=JSON.stringify(entry.payload,null,2);item.append(heading,payload);area.append(item);}if(!data.submissions.length)area.textContent='No submissions yet.';}catch(error){message(error.message,true);}}
+async function setStatus(form){try{await api('/v1/admin/forms/'+encodeURIComponent(form.publicKey),{method:'PATCH',body:JSON.stringify({status:form.status==='active'?'disabled':'active'})});message('Form status updated.');await load();}catch(error){message(error.message,true);}}
+$('login').onsubmit=async event=>{event.preventDefault();const fields=new FormData(event.currentTarget);try{await api('/v1/admin/login',{method:'POST',body:JSON.stringify({email:fields.get('email'),password:fields.get('password')})});event.currentTarget.reset();message('Signed in.');await load();}catch(error){message(error.message,true);}};
+$('logout').onclick=async()=>{await api('/v1/admin/logout',{method:'POST'});message('Signed out.');await load();};
+$('add-user').onsubmit=async event=>{event.preventDefault();const fields=new FormData(event.currentTarget);try{await api('/v1/admin/users',{method:'POST',body:JSON.stringify({email:fields.get('email'),password:fields.get('password'),role:'site',formKey:fields.get('formKey')})});event.currentTarget.reset();message('Site admin added. Share the login details privately.');}catch(error){message(error.message,true);}};
+load();
+</script></body></html>

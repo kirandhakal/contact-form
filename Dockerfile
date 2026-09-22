@@ -15,6 +15,7 @@ COPY package*.json ./
 RUN npm ci --omit=dev && npm cache clean --force
 COPY --from=build /app/dist ./dist
 COPY --from=build /app/migrations ./migrations
+COPY --from=build /app/public ./public
 USER node
 EXPOSE 3100
 CMD ["node", "dist/server.js"]

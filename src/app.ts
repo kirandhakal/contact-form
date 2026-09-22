@@ -1,7 +1,11 @@
 import { createRequire } from "node:module";
+import { readFile } from "node:fs/promises";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { Ajv2020, type ErrorObject } from "ajv/dist/2020.js";
 import type { FormatsPlugin } from "ajv-formats";
 import Fastify, { type FastifyError, type FastifyReply } from "fastify";
+import { hashPassword, hashSessionToken, newSessionToken, verifyPassword } from "./admin-auth.js";
 import type { AppConfig } from "./config.js";
 import { FixedWindowRateLimiter } from "./rate-limit.js";
 import {
@@ -9,12 +13,10 @@ import {
   applySecurityHeaders,
   constantTimeEqual,
   hashIp,
-  hashSubmissionToken,
   isAllowedOrigin,
   isSafeWebhookUrl,
   isValidIdempotencyKey,
-  newPublicKey,
-  newSubmissionToken
+  newPublicKey
 } from "./security.js";
 import type { CreateFormInput, JsonObject, Store } from "./types.js";
 
@@ -67,6 +69,7 @@ const validateCreateForm = createFormAjv.compile({
   required: ["tenantName", "name", "allowedOrigins", "schema"],
   properties: {
     tenantName: { type: "string", minLength: 1, maxLength: 200 },
+    tenantId: { type: "string", format: "uuid" },
     name: { type: "string", minLength: 1, maxLength: 200 },
     allowedOrigins: {
       type: "array",
@@ -103,6 +106,22 @@ export function buildApp(config: AppConfig, store: Store) {
     bodyLimit: config.MAX_BODY_BYTES
   });
   const limiter = new FixedWindowRateLimiter(config.RATE_LIMIT_WINDOW_SECONDS * 1000, config.RATE_LIMIT_MAX);
+  const loginLimiter = new FixedWindowRateLimiter(15 * 60 * 1000, 10);
+
+  async function adminFor(request: { headers: Record<string, unknown> }) {
+    const auth = request.headers.authorization;
+    if (typeof auth === "string" && constantTimeEqual(auth, `Bearer ${config.ADMIN_API_KEY}`)) {
+      return { id: "service-key", email: "service-key", role: "service" as const, tenantId: null };
+    }
+    const cookie = request.headers.cookie;
+    const token = typeof cookie === "string" ? /(?:^|;\s*)contact_admin=([A-Za-z0-9_-]{43})/.exec(cookie)?.[1] : undefined;
+    return token ? store.getAdminBySession(hashSessionToken(token)) : null;
+  }
+
+  function sameOrigin(request: { headers: Record<string, unknown> }): boolean {
+    const origin = request.headers.origin;
+    return typeof origin === "string" && origin === new URL(config.PUBLIC_BASE_URL).origin;
+  }
 
   app.addHook("onSend", async (_request, reply) => {
     applySecurityHeaders(reply);
@@ -128,17 +147,86 @@ export function buildApp(config: AppConfig, store: Store) {
 
   app.get("/health/live", async () => ({ status: "ok" }));
 
+  app.get("/admin", async (_request, reply) => {
+    const path = join(dirname(fileURLToPath(import.meta.url)), "..", "public", "admin.html");
+    reply.header("Cache-Control", "no-store");
+    return reply.type("text/html; charset=utf-8").send(await readFile(path, "utf8"));
+  });
+
   app.get("/health/ready", async (_request, reply) => {
     if (await store.ready()) return { status: "ok" };
     return problem(reply, 503, "Database not ready", "Database connectivity check failed.");
   });
 
-  app.post("/v1/admin/forms", async (request, reply) => {
-    const auth = request.headers.authorization ?? "";
-    const expected = `Bearer ${config.ADMIN_API_KEY}`;
-    if (!constantTimeEqual(auth, expected)) {
-      return problem(reply, 401, "Unauthorized", "Missing or invalid admin token.");
+  app.post("/v1/admin/login", async (request, reply) => {
+    if (!sameOrigin(request)) return problem(reply, 403, "Forbidden", "Use the hosted admin page.");
+    const limit = loginLimiter.check(request.ip);
+    if (!limit.allowed) return problem(reply, 429, "Too many attempts", "Try again later.");
+    if (!assertPlainObject(request.body) || typeof request.body.email !== "string" ||
+      typeof request.body.password !== "string") return problem(reply, 400, "Invalid request", "Email and password are required.");
+    const email = request.body.email.trim().toLowerCase();
+    const admin = await store.getAdminByEmail(email);
+    if (!admin || !(await verifyPassword(request.body.password, admin.passwordHash))) {
+      return problem(reply, 401, "Unauthorized", "Invalid email or password.");
     }
+    const token = newSessionToken();
+    await store.createAdminSession(admin.id, hashSessionToken(token), new Date(Date.now() + 8 * 60 * 60 * 1000));
+    const secure = new URL(config.PUBLIC_BASE_URL).protocol === "https:" ? "; Secure" : "";
+    reply.header("Set-Cookie", `contact_admin=${token}; HttpOnly; SameSite=Strict; Path=/v1/admin; Max-Age=28800${secure}`);
+    reply.header("Cache-Control", "no-store");
+    return { email: admin.email, role: admin.role };
+  });
+
+  app.post("/v1/admin/logout", async (request, reply) => {
+    if (!sameOrigin(request)) return problem(reply, 403, "Forbidden", "Invalid origin.");
+    const token = /(?:^|;\s*)contact_admin=([A-Za-z0-9_-]{43})/.exec(request.headers.cookie ?? "")?.[1];
+    if (token) await store.deleteAdminSession(hashSessionToken(token));
+    reply.header("Set-Cookie", "contact_admin=; HttpOnly; SameSite=Strict; Path=/v1/admin; Max-Age=0");
+    return { ok: true };
+  });
+
+  app.get("/v1/admin/me", async (request, reply) => {
+    const admin = await adminFor(request);
+    if (!admin) return problem(reply, 401, "Unauthorized", "Sign in required.");
+    reply.header("Cache-Control", "no-store");
+    return { email: admin.email, role: admin.role, tenantId: admin.tenantId };
+  });
+
+  app.post("/v1/admin/users", async (request, reply) => {
+    if (!sameOrigin(request) && !constantTimeEqual(request.headers.authorization ?? "", `Bearer ${config.ADMIN_API_KEY}`)) {
+      return problem(reply, 403, "Forbidden", "Invalid origin.");
+    }
+    const actor = await adminFor(request);
+    if (!actor) return problem(reply, 401, "Unauthorized", "Sign in required.");
+    if (!assertPlainObject(request.body) || typeof request.body.email !== "string" ||
+      typeof request.body.password !== "string" || typeof request.body.role !== "string") {
+      return problem(reply, 400, "Invalid request", "Email, password, and role are required.");
+    }
+    const { email, password, role } = request.body;
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || email.length > 254 || password.length < 12 || password.length > 256 ||
+      !["service", "site"].includes(role)) return problem(reply, 422, "Invalid request", "Invalid email, password, or role.");
+    if (actor.role !== "service" && role !== "site") return problem(reply, 403, "Forbidden", "Site admins can add site admins only.");
+    const formKey = request.body.formKey;
+    const tenantId = role === "site"
+      ? actor.role === "site" ? actor.tenantId : typeof formKey === "string" ? await store.getTenantIdForForm(formKey) : null
+      : null;
+    if (role === "site" && !tenantId) return problem(reply, 422, "Invalid request", "A registered form key is required.");
+    try {
+      await store.createAdmin(email.trim().toLowerCase(), await hashPassword(password), role as "service" | "site", tenantId);
+    } catch (error) {
+      if (typeof error === "object" && error !== null && "code" in error && error.code === "23505") {
+        return problem(reply, 409, "Conflict", "This email already has an account.");
+      }
+      throw error;
+    }
+    return reply.code(201).send({ email: email.trim().toLowerCase(), role, tenantId });
+  });
+
+  app.post("/v1/admin/forms", async (request, reply) => {
+    const admin = await adminFor(request);
+    if (!admin) return problem(reply, 401, "Unauthorized", "Sign in required.");
+    if (admin.role !== "service") return problem(reply, 403, "Forbidden", "Service admin required.");
+    if (admin.id !== "service-key" && !sameOrigin(request)) return problem(reply, 403, "Forbidden", "Invalid origin.");
     if (!validateCreateForm(request.body)) {
       return problem(reply, 422, "Validation failed", "Form definition is invalid.", {
         errors: validationErrors(validateCreateForm.errors)
@@ -165,6 +253,7 @@ export function buildApp(config: AppConfig, store: Store) {
     const form = await store.createForm(input, publicKey);
     return reply.code(201).send({
       id: form.id,
+      tenantId: form.tenantId,
       publicKey: form.publicKey,
       submitUrl: `${config.PUBLIC_BASE_URL}/v1/forms/${form.publicKey}/submissions`
     });
@@ -188,12 +277,29 @@ export function buildApp(config: AppConfig, store: Store) {
   });
 
   app.get("/v1/admin/forms/summary", async (request, reply) => {
-    const auth = request.headers.authorization ?? "";
-    const expected = `Bearer ${config.ADMIN_API_KEY}`;
-    if (!constantTimeEqual(auth, expected)) {
+    const admin = await adminFor(request);
+    if (!admin) {
       return problem(reply, 401, "Unauthorized", "Missing or invalid admin token.");
     }
-    return { forms: await store.listFormSummaries() };
+    reply.header("Cache-Control", "no-store");
+    const forms = await store.listFormSummaries();
+    return { forms: admin.role === "service" ? forms : forms.filter((form) => form.tenantId === admin.tenantId) };
+  });
+
+  app.patch<{ Params: { publicKey: string } }>("/v1/admin/forms/:publicKey", async (request, reply) => {
+    const admin = await adminFor(request);
+    if (!admin) return problem(reply, 401, "Unauthorized", "Sign in required.");
+    if (!sameOrigin(request) && admin.id !== "service-key") return problem(reply, 403, "Forbidden", "Invalid origin.");
+    if (!assertPlainObject(request.body) || !["active", "disabled"].includes(String(request.body.status))) {
+      return problem(reply, 422, "Invalid request", "Status must be active or disabled.");
+    }
+    const tenantId = await store.getTenantIdForForm(request.params.publicKey);
+    if (!tenantId || (admin.role === "site" && tenantId !== admin.tenantId)) {
+      return problem(reply, 404, "Not found", "Form not found.");
+    }
+    const status = request.body.status as "active" | "disabled";
+    await store.setFormStatus(request.params.publicKey, status);
+    return { publicKey: request.params.publicKey, status };
   });
 
   app.post<{ Params: { publicKey: string } }>("/v1/forms/:publicKey/submissions", async (request, reply) => {
@@ -236,7 +342,6 @@ export function buildApp(config: AppConfig, store: Store) {
     }
 
     const expiresAt = new Date(Date.now() + config.RETENTION_DAYS * 24 * 60 * 60 * 1000);
-    const accessToken = spam ? undefined : newSubmissionToken();
     const result = await store.createSubmission({
       form,
       payload,
@@ -244,58 +349,27 @@ export function buildApp(config: AppConfig, store: Store) {
       sourceOrigin: request.headers.origin,
       sourceIpHash: ipHash,
       idempotencyKey,
-      expiresAt,
-      accessTokenHash: accessToken ? hashSubmissionToken(accessToken, config.DATA_ENCRYPTION_KEY) : undefined
+      expiresAt
     });
     return reply.code(result.duplicate ? 200 : 202).send({
-      id: result.submission.id,
       status: result.submission.status,
-      duplicate: result.duplicate,
-      message: form.successMessage,
-      ...(result.duplicate || !accessToken ? {} : { accessToken })
+      message: form.successMessage
     });
   });
-
-  app.get<{ Params: { publicKey: string; submissionId: string } }>(
-    "/v1/forms/:publicKey/submissions/:submissionId",
-    async (request, reply) => {
-      const form = await store.getActiveForm(request.params.publicKey);
-      if (!form) return problem(reply, 404, "Not found", "Form not found or disabled.");
-      if (!isAllowedOrigin(request.headers.origin, form.allowedOrigins)) {
-        return problem(reply, 403, "Forbidden", "Origin is not allowed for this form.");
-      }
-      applyCors(reply, request.headers.origin);
-      const token = firstHeader(request.headers["submission-token"]);
-      if (!token || token.length < 32 || token.length > 128) {
-        return problem(reply, 401, "Unauthorized", "A valid submission token is required.");
-      }
-      const submission = await store.getSubmissionByAccessToken(
-        request.params.publicKey,
-        request.params.submissionId,
-        hashSubmissionToken(token, config.DATA_ENCRYPTION_KEY)
-      );
-      if (!submission) return problem(reply, 404, "Not found", "Submission not found or access has expired.");
-      return {
-        submission: {
-          id: submission.id,
-          payload: submission.payload,
-          status: submission.status,
-          createdAt: submission.createdAt,
-          expiresAt: submission.expiresAt
-        }
-      };
-    }
-  );
 
   app.get<{ Params: { publicKey: string }; Querystring: { limit?: string } }>(
     "/v1/admin/forms/:publicKey/submissions",
     async (request, reply) => {
-      const auth = request.headers.authorization ?? "";
-      const expected = `Bearer ${config.ADMIN_API_KEY}`;
-      if (!constantTimeEqual(auth, expected)) {
+      const admin = await adminFor(request);
+      if (!admin) {
         return problem(reply, 401, "Unauthorized", "Missing or invalid admin token.");
       }
+      const tenantId = await store.getTenantIdForForm(request.params.publicKey);
+      if (!tenantId || (admin.role === "site" && tenantId !== admin.tenantId)) {
+        return problem(reply, 404, "Not found", "Form not found.");
+      }
       const limit = Math.min(Math.max(Number(request.query.limit ?? 50) || 50, 1), 200);
+      reply.header("Cache-Control", "no-store");
       return { submissions: await store.listSubmissions(request.params.publicKey, limit) };
     }
   );

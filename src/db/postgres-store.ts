@@ -76,7 +76,10 @@ export class PostgresStore implements Store {
     const client = await this.pool.connect();
     try {
       await client.query("begin");
-      const tenant = await client.query("insert into tenants(name) values($1) returning id", [input.tenantName]);
+      const tenant = input.tenantId
+        ? await client.query("select id from tenants where id = $1", [input.tenantId])
+        : await client.query("insert into tenants(name) values($1) returning id", [input.tenantName]);
+      if (!tenant.rowCount) throw new Error("Tenant not found");
       const form = await client.query(
         `insert into forms(tenant_id, public_key, name, allowed_origins, success_message, honeypot_field)
          values($1, $2, $3, $4, $5, $6)
@@ -134,7 +137,6 @@ export class PostgresStore implements Store {
     sourceIpHash: string;
     idempotencyKey?: string;
     expiresAt: Date;
-    accessTokenHash?: string;
   }): Promise<SubmissionResult> {
     const client = await this.pool.connect();
     try {
@@ -151,8 +153,8 @@ export class PostgresStore implements Store {
       }
 
       const inserted = await client.query(
-        `insert into submissions(tenant_id, form_id, form_version, payload, status, source_origin, source_ip_hash, idempotency_key, expires_at, access_token_hash)
-         values($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+        `insert into submissions(tenant_id, form_id, form_version, payload, status, source_origin, source_ip_hash, idempotency_key, expires_at)
+         values($1, $2, $3, $4, $5, $6, $7, $8, $9)
          returning *`,
         [
           args.form.tenantId,
@@ -163,8 +165,7 @@ export class PostgresStore implements Store {
           args.sourceOrigin ?? null,
           args.sourceIpHash,
           args.idempotencyKey ?? null,
-          args.expiresAt,
-          args.accessTokenHash ?? null
+          args.expiresAt
         ]
       );
       if (args.status === "accepted") {
@@ -184,16 +185,46 @@ export class PostgresStore implements Store {
     }
   }
 
-  async getSubmissionByAccessToken(publicKey: string, submissionId: string, accessTokenHash: string): Promise<SubmissionRecord | null> {
-    const result = await this.pool.query(
-      `select s.*
-       from submissions s
-       join forms f on f.id = s.form_id
-       where f.public_key = $1 and s.id = $2 and s.access_token_hash = $3
-         and s.status = 'accepted' and s.expires_at > now()`,
-      [publicKey, submissionId, accessTokenHash]
+  async createAdmin(email: string, passwordHash: string, role: "service" | "site", tenantId: string | null): Promise<void> {
+    await this.pool.query(
+      "insert into admin_users(email, password_hash, role, tenant_id) values($1, $2, $3, $4)",
+      [email, passwordHash, role, tenantId]
     );
-    return result.rowCount ? mapSubmission(result.rows[0]) : null;
+  }
+
+  async getAdminByEmail(email: string) {
+    const result = await this.pool.query("select id, email, password_hash, role, tenant_id from admin_users where email = $1", [email]);
+    if (!result.rowCount) return null;
+    const row = result.rows[0];
+    return { id: row.id as string, email: row.email as string, passwordHash: row.password_hash as string, role: row.role as "service" | "site", tenantId: row.tenant_id as string | null };
+  }
+
+  async createAdminSession(adminId: string, tokenHash: string, expiresAt: Date): Promise<void> {
+    await this.pool.query("insert into admin_sessions(token_hash, admin_id, expires_at) values($1, $2, $3)", [tokenHash, adminId, expiresAt]);
+  }
+
+  async getAdminBySession(tokenHash: string) {
+    const result = await this.pool.query(
+      `select u.id, u.email, u.role, u.tenant_id from admin_sessions s
+       join admin_users u on u.id = s.admin_id where s.token_hash = $1 and s.expires_at > now()`, [tokenHash]
+    );
+    if (!result.rowCount) return null;
+    const row = result.rows[0];
+    return { id: row.id as string, email: row.email as string, role: row.role as "service" | "site", tenantId: row.tenant_id as string | null };
+  }
+
+  async deleteAdminSession(tokenHash: string): Promise<void> {
+    await this.pool.query("delete from admin_sessions where token_hash = $1", [tokenHash]);
+  }
+
+  async getTenantIdForForm(publicKey: string): Promise<string | null> {
+    const result = await this.pool.query("select tenant_id from forms where public_key = $1", [publicKey]);
+    return result.rowCount ? result.rows[0].tenant_id as string : null;
+  }
+
+  async setFormStatus(publicKey: string, status: "active" | "disabled"): Promise<boolean> {
+    const result = await this.pool.query("update forms set status = $2 where public_key = $1", [publicKey, status]);
+    return (result.rowCount ?? 0) > 0;
   }
 
   async listSubmissions(publicKey: string, limit: number): Promise<SubmissionRecord[]> {
@@ -213,6 +244,7 @@ export class PostgresStore implements Store {
     const result = await this.pool.query(
       `select
          t.name as tenant_name,
+         f.tenant_id,
          f.public_key,
          f.name,
          f.status,
@@ -245,6 +277,7 @@ export class PostgresStore implements Store {
        order by totals.submission_count desc, totals.last_submitted_at desc nulls last, f.created_at desc`
     );
     return result.rows.map((row) => ({
+      tenantId: row.tenant_id,
       tenantName: row.tenant_name,
       publicKey: row.public_key,
       name: row.name,
