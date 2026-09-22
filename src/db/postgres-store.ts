@@ -136,6 +136,7 @@ export class PostgresStore implements Store {
     sourceOrigin?: string;
     sourceIpHash: string;
     idempotencyKey?: string;
+    accessTokenHash: string;
     expiresAt: Date;
   }): Promise<SubmissionResult> {
     const client = await this.pool.connect();
@@ -153,8 +154,8 @@ export class PostgresStore implements Store {
       }
 
       const inserted = await client.query(
-        `insert into submissions(tenant_id, form_id, form_version, payload, status, source_origin, source_ip_hash, idempotency_key, expires_at)
-         values($1, $2, $3, $4, $5, $6, $7, $8, $9)
+        `insert into submissions(tenant_id, form_id, form_version, payload, status, source_origin, source_ip_hash, idempotency_key, access_token_hash, expires_at)
+         values($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
          returning *`,
         [
           args.form.tenantId,
@@ -165,6 +166,7 @@ export class PostgresStore implements Store {
           args.sourceOrigin ?? null,
           args.sourceIpHash,
           args.idempotencyKey ?? null,
+          args.accessTokenHash,
           args.expiresAt
         ]
       );
@@ -183,6 +185,19 @@ export class PostgresStore implements Store {
     } finally {
       client.release();
     }
+  }
+
+  async getSubmissionByAccessToken(submissionId: string, accessTokenHash: string) {
+    const result = await this.pool.query(
+      `select s.*, f.allowed_origins
+       from submissions s
+       join forms f on f.id = s.form_id
+       where s.id = $1 and s.access_token_hash = $2 and s.status <> 'deleted' and s.expires_at > now()`,
+      [submissionId, accessTokenHash]
+    );
+    return result.rowCount
+      ? { submission: mapSubmission(result.rows[0]), allowedOrigins: result.rows[0].allowed_origins as string[] }
+      : null;
   }
 
   async createAdmin(email: string, passwordHash: string, role: "service" | "site", tenantId: string | null): Promise<void> {

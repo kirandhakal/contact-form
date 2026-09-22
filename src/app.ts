@@ -13,10 +13,12 @@ import {
   applySecurityHeaders,
   constantTimeEqual,
   hashIp,
+  hashSubmissionAccessToken,
   isAllowedOrigin,
   isSafeWebhookUrl,
   isValidIdempotencyKey,
-  newPublicKey
+  newPublicKey,
+  newSubmissionAccessToken
 } from "./security.js";
 import type { CreateFormInput, JsonObject, Store } from "./types.js";
 
@@ -225,14 +227,17 @@ export function buildApp(config: AppConfig, store: Store) {
   app.post("/v1/admin/forms", async (request, reply) => {
     const admin = await adminFor(request);
     if (!admin) return problem(reply, 401, "Unauthorized", "Sign in required.");
-    if (admin.role !== "service") return problem(reply, 403, "Forbidden", "Service admin required.");
     if (admin.id !== "service-key" && !sameOrigin(request)) return problem(reply, 403, "Forbidden", "Invalid origin.");
     if (!validateCreateForm(request.body)) {
       return problem(reply, 422, "Validation failed", "Form definition is invalid.", {
         errors: validationErrors(validateCreateForm.errors)
       });
     }
-    const input = request.body as CreateFormInput;
+    // Site admins may add forms, but only to the tenant attached to their
+    // account. Never trust a tenant id supplied by a browser session.
+    const input: CreateFormInput = admin.role === "site"
+      ? { ...(request.body as CreateFormInput), tenantId: admin.tenantId ?? undefined }
+      : request.body as CreateFormInput;
     for (const origin of input.allowedOrigins) {
       if (!isAllowedOrigin(origin, [origin])) {
         return problem(reply, 422, "Validation failed", "Allowed origins must be exact HTTP or HTTPS origins.");
@@ -342,6 +347,7 @@ export function buildApp(config: AppConfig, store: Store) {
     }
 
     const expiresAt = new Date(Date.now() + config.RETENTION_DAYS * 24 * 60 * 60 * 1000);
+    const accessToken = newSubmissionAccessToken();
     const result = await store.createSubmission({
       form,
       payload,
@@ -349,12 +355,45 @@ export function buildApp(config: AppConfig, store: Store) {
       sourceOrigin: request.headers.origin,
       sourceIpHash: ipHash,
       idempotencyKey,
+      accessTokenHash: hashSubmissionAccessToken(accessToken),
       expiresAt
     });
-    return reply.code(result.duplicate ? 200 : 202).send({
+    const response = {
       status: result.submission.status,
-      message: form.successMessage
-    });
+      message: form.successMessage,
+      ...(!result.duplicate && {
+        submissionId: result.submission.id,
+        responseUrl: `${config.PUBLIC_BASE_URL}/v1/submissions/${result.submission.id}`,
+        responseToken: accessToken
+      })
+    };
+    return reply.code(result.duplicate ? 200 : 202).send(response);
+  });
+
+  app.get<{ Params: { submissionId: string } }>("/v1/submissions/:submissionId", async (request, reply) => {
+    const authorization = request.headers.authorization;
+    const token = typeof authorization === "string" && authorization.startsWith("Bearer ")
+      ? authorization.slice(7)
+      : "";
+    if (!/^[A-Za-z0-9_-]{43}$/.test(token)) {
+      return problem(reply, 401, "Unauthorized", "A valid response token is required.");
+    }
+    const result = await store.getSubmissionByAccessToken(
+      request.params.submissionId,
+      hashSubmissionAccessToken(token)
+    );
+    if (!result) return problem(reply, 404, "Not found", "Submission not found or expired.");
+    if (!isAllowedOrigin(request.headers.origin, result.allowedOrigins)) {
+      return problem(reply, 403, "Forbidden", "Origin is not allowed for this form.");
+    }
+    applyCors(reply, request.headers.origin);
+    reply.header("Cache-Control", "no-store");
+    return {
+      id: result.submission.id,
+      status: result.submission.status,
+      payload: result.submission.payload,
+      createdAt: result.submission.createdAt
+    };
   });
 
   app.get<{ Params: { publicKey: string }; Querystring: { limit?: string } }>(

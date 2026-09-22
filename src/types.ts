@@ -100,8 +100,13 @@ export interface Store {
     sourceOrigin?: string;
     sourceIpHash: string;
     idempotencyKey?: string;
+    accessTokenHash: string;
     expiresAt: Date;
   }): Promise<SubmissionResult>;
+  getSubmissionByAccessToken(submissionId: string, accessTokenHash: string): Promise<{
+    submission: SubmissionRecord;
+    allowedOrigins: string[];
+  } | null>;
   createAdmin(email: string, passwordHash: string, role: "service" | "site", tenantId: string | null): Promise<void>;
   getAdminByEmail(email: string): Promise<{ id: string; email: string; passwordHash: string; role: "service" | "site"; tenantId: string | null } | null>;
   createAdminSession(adminId: string, tokenHash: string, expiresAt: Date): Promise<void>;

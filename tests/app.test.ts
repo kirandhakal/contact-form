@@ -87,6 +87,7 @@ class MemoryStore implements Store {
     sourceOrigin?: string;
     sourceIpHash: string;
     idempotencyKey?: string;
+    accessTokenHash: string;
     expiresAt: Date;
   }): Promise<SubmissionResult> {
     const existing = args.idempotencyKey
@@ -107,7 +108,17 @@ class MemoryStore implements Store {
       createdAt: new Date().toISOString()
     };
     this.submissions.push(submission);
+    this.accessTokens.set(submission.id, args.accessTokenHash);
     return { submission, duplicate: false };
+  }
+
+  accessTokens = new Map<string, string>();
+  async getSubmissionByAccessToken(submissionId: string, accessTokenHash: string) {
+    const submission = this.submissions.find((item) => item.id === submissionId);
+    const form = submission ? [...this.forms.values()].find((item) => item.id === submission.formId) : undefined;
+    return submission && form && this.accessTokens.get(submissionId) === accessTokenHash
+      ? { submission, allowedOrigins: form.allowedOrigins }
+      : null;
   }
 
   async listSubmissions(publicKey: string, limit: number) {
@@ -184,6 +195,34 @@ async function createTestForm(store: MemoryStore) {
 }
 
 describe("contact form API", () => {
+  it("lets a site admin create forms only in their own tenant", async () => {
+    const store = new MemoryStore();
+    const { app, body } = await createTestForm(store);
+    const tenantId = store.forms.get(body.publicKey)?.tenantId;
+    await app.inject({
+      method: "POST", url: "/v1/admin/users",
+      headers: { authorization: `Bearer ${config.ADMIN_API_KEY}` },
+      payload: { email: "builder@example.com", password: "a-long-secret-password", role: "site", formKey: body.publicKey }
+    });
+    const login = await app.inject({
+      method: "POST", url: "/v1/admin/login", headers: { origin: config.PUBLIC_BASE_URL },
+      payload: { email: "builder@example.com", password: "a-long-secret-password" }
+    });
+    const created = await app.inject({
+      method: "POST", url: "/v1/admin/forms",
+      headers: { cookie: login.headers["set-cookie"] as string, origin: config.PUBLIC_BASE_URL },
+      payload: {
+        tenantName: "Ignored browser value",
+        tenantId: randomUUID(),
+        name: "Registration",
+        allowedOrigins: ["https://www.example.com"],
+        schema: { type: "object", additionalProperties: false, properties: {} }
+      }
+    });
+    expect(created.statusCode).toBe(201);
+    expect(created.json().tenantId).toBe(tenantId);
+  });
+
   it("limits a site admin to their own tenant", async () => {
     const store = new MemoryStore();
     const { app, body } = await createTestForm(store);
@@ -239,7 +278,32 @@ describe("contact form API", () => {
     });
     expect(ok.statusCode).toBe(202);
     expect(ok.json().status).toBe("accepted");
-    expect(ok.json()).toEqual({ status: "accepted", message: "Thank you. We received your message." });
+    expect(ok.json()).toEqual(expect.objectContaining({
+      status: "accepted",
+      message: "Thank you. We received your message.",
+      submissionId: expect.any(String),
+      responseUrl: expect.any(String),
+      responseToken: expect.any(String)
+    }));
+
+    const created = ok.json() as { responseUrl: string; responseToken: string };
+    const ownResponse = await app.inject({
+      method: "GET",
+      url: created.responseUrl,
+      headers: { origin: "https://www.example.com", authorization: `Bearer ${created.responseToken}` }
+    });
+    expect(ownResponse.statusCode).toBe(200);
+    expect(ownResponse.json()).toEqual(expect.objectContaining({
+      status: "accepted",
+      payload: { name: "Jane", email: "jane@example.com", topic: "support" }
+    }));
+
+    const cannotReadFromAnotherOrigin = await app.inject({
+      method: "GET",
+      url: created.responseUrl,
+      headers: { origin: "https://evil.example.com", authorization: `Bearer ${created.responseToken}` }
+    });
+    expect(cannotReadFromAnotherOrigin.statusCode).toBe(403);
 
     const blocked = await app.inject({
       method: "POST",
