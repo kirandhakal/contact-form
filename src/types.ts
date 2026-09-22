@@ -91,6 +91,7 @@ export interface OutboxJob {
 
 export interface Store {
   ready(): Promise<boolean>;
+  createSiteAccount(tenantName: string, email: string, passwordHash: string): Promise<{ tenantId: string }>;
   createForm(input: CreateFormInput, publicKey: string): Promise<FormRecord>;
   getActiveForm(publicKey: string): Promise<FormRecord | null>;
   createSubmission(args: {

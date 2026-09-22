@@ -38,6 +38,12 @@ class MemoryStore implements Store {
   admins = new Map<string, { id: string; email: string; passwordHash: string; role: "service" | "site"; tenantId: string | null }>();
   sessions = new Map<string, string>();
 
+  async createSiteAccount(tenantName: string, email: string, passwordHash: string) {
+    const tenantId = randomUUID();
+    this.admins.set(email, { id: randomUUID(), email, passwordHash, role: "site", tenantId });
+    return { tenantId };
+  }
+
   async createAdmin(email: string, passwordHash: string, role: "service" | "site", tenantId: string | null) {
     this.admins.set(email, { id: randomUUID(), email, passwordHash, role, tenantId });
   }
@@ -195,6 +201,47 @@ async function createTestForm(store: MemoryStore) {
 }
 
 describe("contact form API", () => {
+  it("signs up a customer workspace and lets its owner create forms", async () => {
+    const store = new MemoryStore();
+    const app = buildApp(config, store);
+    const signup = await app.inject({
+      method: "POST",
+      url: "/v1/auth/signup",
+      headers: { origin: config.PUBLIC_BASE_URL },
+      payload: { workspaceName: "New Studio", email: "owner@studio.test", password: "a-secure-password" }
+    });
+    expect(signup.statusCode).toBe(201);
+    expect(signup.json()).toEqual(expect.objectContaining({ email: "owner@studio.test", role: "site" }));
+
+    const login = await app.inject({
+      method: "POST",
+      url: "/v1/admin/login",
+      headers: { origin: config.PUBLIC_BASE_URL },
+      payload: { email: "owner@studio.test", password: "a-secure-password" }
+    });
+    expect(login.statusCode).toBe(200);
+
+    const created = await app.inject({
+      method: "POST",
+      url: "/v1/admin/forms",
+      headers: { cookie: login.headers["set-cookie"] as string, origin: config.PUBLIC_BASE_URL },
+      payload: {
+        tenantName: "Current workspace",
+        name: "Order form",
+        allowedOrigins: ["https://shop.example.com"],
+        schema: {
+          type: "object",
+          additionalProperties: false,
+          properties: {
+            products: { type: "array", items: { type: "string", enum: ["One", "Two"] }, uniqueItems: true }
+          }
+        }
+      }
+    });
+    expect(created.statusCode).toBe(201);
+    expect(created.json().tenantId).toBe(signup.json().tenantId);
+  });
+
   it("lets a site admin create forms only in their own tenant", async () => {
     const store = new MemoryStore();
     const { app, body } = await createTestForm(store);

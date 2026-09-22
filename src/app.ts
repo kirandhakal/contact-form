@@ -109,6 +109,13 @@ export function buildApp(config: AppConfig, store: Store) {
   });
   const limiter = new FixedWindowRateLimiter(config.RATE_LIMIT_WINDOW_SECONDS * 1000, config.RATE_LIMIT_MAX);
   const loginLimiter = new FixedWindowRateLimiter(15 * 60 * 1000, 10);
+  const signupLimiter = new FixedWindowRateLimiter(60 * 60 * 1000, 5);
+
+  async function sendPublicPage(reply: FastifyReply, filename: string) {
+    const path = join(dirname(fileURLToPath(import.meta.url)), "..", "public", filename);
+    reply.header("Cache-Control", "no-store");
+    return reply.type("text/html; charset=utf-8").send(await readFile(path, "utf8"));
+  }
 
   async function adminFor(request: { headers: Record<string, unknown> }) {
     const auth = request.headers.authorization;
@@ -149,11 +156,11 @@ export function buildApp(config: AppConfig, store: Store) {
 
   app.get("/health/live", async () => ({ status: "ok" }));
 
-  app.get("/admin", async (_request, reply) => {
-    const path = join(dirname(fileURLToPath(import.meta.url)), "..", "public", "admin.html");
-    reply.header("Cache-Control", "no-store");
-    return reply.type("text/html; charset=utf-8").send(await readFile(path, "utf8"));
-  });
+  app.get("/", async (_request, reply) => reply.redirect("/auth"));
+  app.get("/auth", async (_request, reply) => sendPublicPage(reply, "auth.html"));
+  app.get("/auth/admin", async (_request, reply) => sendPublicPage(reply, "auth.html"));
+  app.get("/dashboard", async (_request, reply) => sendPublicPage(reply, "admin.html"));
+  app.get("/admin", async (_request, reply) => reply.redirect("/auth/admin"));
 
   app.get("/health/ready", async (_request, reply) => {
     if (await store.ready()) return { status: "ok" };
@@ -177,6 +184,32 @@ export function buildApp(config: AppConfig, store: Store) {
     reply.header("Set-Cookie", `contact_admin=${token}; HttpOnly; SameSite=Strict; Path=/v1/admin; Max-Age=28800${secure}`);
     reply.header("Cache-Control", "no-store");
     return { email: admin.email, role: admin.role };
+  });
+
+  app.post("/v1/auth/signup", async (request, reply) => {
+    if (!sameOrigin(request)) return problem(reply, 403, "Forbidden", "Use the hosted signup page.");
+    const limit = signupLimiter.check(request.ip);
+    if (!limit.allowed) return problem(reply, 429, "Too many attempts", "Try again later.");
+    if (!assertPlainObject(request.body) || typeof request.body.workspaceName !== "string" ||
+      typeof request.body.email !== "string" || typeof request.body.password !== "string") {
+      return problem(reply, 400, "Invalid request", "Workspace name, email, and password are required.");
+    }
+    const workspaceName = request.body.workspaceName.trim();
+    const email = request.body.email.trim().toLowerCase();
+    const password = request.body.password;
+    if (!workspaceName || workspaceName.length > 200 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) ||
+      email.length > 254 || password.length < 12 || password.length > 256) {
+      return problem(reply, 422, "Invalid request", "Use a valid workspace, email, and password of at least 12 characters.");
+    }
+    try {
+      const account = await store.createSiteAccount(workspaceName, email, await hashPassword(password));
+      return reply.code(201).send({ email, role: "site", tenantId: account.tenantId });
+    } catch (error) {
+      if (typeof error === "object" && error !== null && "code" in error && error.code === "23505") {
+        return problem(reply, 409, "Account exists", "An account with this email already exists.");
+      }
+      throw error;
+    }
   });
 
   app.post("/v1/admin/logout", async (request, reply) => {

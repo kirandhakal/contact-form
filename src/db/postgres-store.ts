@@ -72,6 +72,25 @@ export class PostgresStore implements Store {
     }
   }
 
+  async createSiteAccount(tenantName: string, email: string, passwordHash: string): Promise<{ tenantId: string }> {
+    const client = await this.pool.connect();
+    try {
+      await client.query("begin");
+      const tenant = await client.query("insert into tenants(name) values($1) returning id", [tenantName]);
+      await client.query(
+        "insert into admin_users(email, password_hash, role, tenant_id) values($1, $2, 'site', $3)",
+        [email, passwordHash, tenant.rows[0].id]
+      );
+      await client.query("commit");
+      return { tenantId: tenant.rows[0].id as string };
+    } catch (error) {
+      await client.query("rollback");
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
   async createForm(input: CreateFormInput, publicKey: string): Promise<FormRecord> {
     const client = await this.pool.connect();
     try {
