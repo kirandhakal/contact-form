@@ -1,5 +1,6 @@
 ALTER TABLE admin_users DROP CONSTRAINT IF EXISTS admin_users_role_check;
 ALTER TABLE admin_users DROP CONSTRAINT IF EXISTS admin_users_check;
+ALTER TABLE admin_users DROP CONSTRAINT IF EXISTS admin_users_tenant_check;
 
 UPDATE admin_users SET role = 'tenant' WHERE role = 'site';
 UPDATE admin_users SET role = 'super' WHERE role = 'service';

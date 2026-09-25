@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import { buildApp } from "../src/app.js";
+import type { ListQuery, PageResult } from "../src/management.js";
 import type {
   CreateFormInput,
   AdminRole,
@@ -34,6 +35,16 @@ const config = {
 };
 
 class MemoryStore implements Store {
+  async managementPage(resource: "forms" | "tenants" | "submissions", query: ListQuery, publicKey?: string): Promise<PageResult> {
+    let rows: Record<string, unknown>[] = resource === "forms" ? await this.listFormSummaries() as unknown as Record<string, unknown>[] : resource === "tenants" ? (await this.listTenants()).map(t => ({ ...t, activeFormCount: [...this.forms.values()].filter(f => f.tenantId === t.id && f.status === "active").length })) : this.submissions.filter(s => s.formId === this.forms.get(publicKey!)?.id && s.status !== "deleted") as unknown as Record<string, unknown>[];
+    rows = rows.filter(r => (!query.tenantId || (resource === "tenants" ? r.id : r.tenantId) === query.tenantId) && (!query.q || JSON.stringify(resource === "submissions" ? r.payload : r.name).toLowerCase().includes(query.q.toLowerCase())) && (!query.status || (resource === "tenants" ? query.status === "active" ? Number(r.activeFormCount) > 0 : Number(r.activeFormCount) === 0 : r.status === query.status)) && (resource !== "submissions" || ((!query.from || String(r.createdAt) >= query.from) && (!query.to || String(r.createdAt) <= query.to))));
+    const total = rows.length;
+    return { items: rows.slice((query.page - 1) * query.limit, query.page * query.limit), pagination: { page: query.page, limit: query.limit, total, pages: Math.ceil(total / query.limit) } };
+  }
+  async analytics(tenantId?: string) {
+    const forms = [...this.forms.values()].filter(f => !tenantId || f.tenantId === tenantId);
+    return { forms: forms.length, activeForms: forms.filter(f => f.status === "active").length, mostUsedForms: forms.map(f => ({ publicKey: f.publicKey, name: f.name })) };
+  }
   forms = new Map<string, FormRecord>();
   submissions: SubmissionRecord[] = [];
   admins = new Map<string, { id: string; email: string; passwordHash: string; role: AdminRole; tenantId: string | null }>();
@@ -59,6 +70,7 @@ class MemoryStore implements Store {
   async updateAdminPassword(adminId: string, passwordHash: string) {
     const admin = [...this.admins.values()].find((item) => item.id === adminId);
     if (admin) admin.passwordHash = passwordHash;
+    for (const [token, id] of this.sessions) if (id === adminId) this.sessions.delete(token);
   }
   async createTenant(name: string) {
     const id = randomUUID();
@@ -247,6 +259,73 @@ async function createTestForm(store: MemoryStore) {
 }
 
 describe("contact form API", () => {
+  it("rate-limits a targeted login without locking out other accounts behind the frontend proxy", async () => {
+    const store = new MemoryStore(); const app = buildApp(config, store);
+    const headers = { origin: config.PUBLIC_BASE_URL };
+    for (let i = 0; i < 10; i++) expect((await app.inject({ method: "POST", url: "/v1/admin/login", headers, payload: { email: "target@example.com", password: "incorrect" } })).statusCode).toBe(401);
+    expect((await app.inject({ method: "POST", url: "/v1/admin/login", headers, payload: { email: "target@example.com", password: "incorrect" } })).statusCode).toBe(429);
+    expect((await app.inject({ method: "POST", url: "/v1/auth/signup", headers, payload: { workspaceName: "Other studio", email: "other@example.com", password: "long-valid-password" } })).statusCode).toBe(201);
+    expect((await app.inject({ method: "POST", url: "/v1/admin/login", headers, payload: { email: "other@example.com", password: "long-valid-password" } })).statusCode).toBe(200);
+    await app.close();
+  });
+  it("paginates forms, rejects invalid filters, and keeps tenant analytics scoped", async () => {
+    const store = new MemoryStore();
+    const { app, body } = await createTestForm(store);
+    await app.inject({ method: "POST", url: "/v1/admin/users", headers: { authorization: `Bearer ${config.ADMIN_API_KEY}` }, payload: { email: "scoped@example.com", password: "a-long-secret-password", role: "tenant", formKey: body.publicKey } });
+    const second = await createTestForm(store); await second.app.close();
+    const login = await app.inject({ method: "POST", url: "/v1/admin/login", headers: { origin: config.PUBLIC_BASE_URL }, payload: { email: "scoped@example.com", password: "a-long-secret-password" } });
+    const headers = { cookie: login.headers["set-cookie"] as string };
+    const foreignTenant = store.forms.get(second.body.publicKey)!.tenantId;
+    const list = await app.inject({ url: `/v1/admin/forms?limit=1&tenantId=${foreignTenant}`, headers });
+    expect(list.statusCode).toBe(200); expect(list.json().forms.map((f: FormRecord) => f.publicKey)).toEqual([body.publicKey]);
+    expect(list.json().pagination).toEqual({ page: 1, limit: 1, total: 1, pages: 1 });
+    const beyond = await app.inject({ url: "/v1/admin/forms?limit=1&page=2", headers });
+    expect(beyond.json().forms).toEqual([]); expect(beyond.json().pagination.total).toBe(1);
+    for (const query of ["page=0", "page=1.5", "limit=101", "status=spam", "from=garbage", "from=2026-09-25T00:00:00Z&to=2026-09-24T00:00:00Z"]) expect((await app.inject({ url: `/v1/admin/forms?${query}`, headers })).statusCode).toBe(400);
+    const analytics = await app.inject({ url: `/v1/admin/analytics?tenantId=${foreignTenant}`, headers });
+    expect(analytics.json().forms).toBe(1); expect(analytics.json().mostUsedForms[0].publicKey).toBe(body.publicKey);
+    expect((await app.inject({ url: `/v1/admin/tenants/${foreignTenant}`, headers })).statusCode).toBe(404);
+    expect((await app.inject({ url: "/v1/admin/tenants", headers })).statusCode).toBe(403);
+    expect((await app.inject({ url: "/v1/admin/analytics" })).statusCode).toBe(401);
+    await app.close();
+  });
+
+  it("creates tenant accounts and revokes their sessions on password reset", async () => {
+    const store = new MemoryStore(); const app = buildApp(config, store);
+    const service = { authorization: `Bearer ${config.ADMIN_API_KEY}` };
+    const created = await app.inject({ method: "POST", url: "/v1/admin/tenants", headers: service, payload: { name: "Studio", email: "owner@example.com", password: "original-password" } });
+    expect(created.statusCode).toBe(201);
+    const login = await app.inject({ method: "POST", url: "/v1/admin/login", headers: { origin: config.PUBLIC_BASE_URL }, payload: { email: "owner@example.com", password: "original-password" } });
+    const cookie = login.headers["set-cookie"] as string;
+    expect(cookie).toContain("HttpOnly"); expect(cookie).toContain("SameSite=Strict");
+    const tenantId = created.json().tenantId;
+    const forbidden = await app.inject({ method: "POST", url: `/v1/admin/tenants/${tenantId}/password`, headers: { cookie, origin: config.PUBLIC_BASE_URL }, payload: { email: "owner@example.com", newPassword: "replacement-password" } });
+    expect(forbidden.statusCode).toBe(403);
+    const reset = await app.inject({ method: "POST", url: `/v1/admin/tenants/${tenantId}/password`, headers: service, payload: { email: "owner@example.com", newPassword: "replacement-password" } });
+    expect(reset.statusCode).toBe(200);
+    expect((await app.inject({ url: "/v1/admin/me", headers: { cookie } })).statusCode).toBe(401);
+    expect((await app.inject({ method: "POST", url: "/v1/admin/login", headers: { origin: config.PUBLIC_BASE_URL }, payload: { email: "owner@example.com", password: "original-password" } })).statusCode).toBe(401);
+    const newLogin = await app.inject({ method: "POST", url: "/v1/admin/login", headers: { origin: config.PUBLIC_BASE_URL }, payload: { email: "owner@example.com", password: "replacement-password" } });
+    expect(newLogin.statusCode).toBe(200);
+    const own = await app.inject({ method: "POST", url: "/v1/admin/password", headers: { cookie: newLogin.headers["set-cookie"] as string, origin: config.PUBLIC_BASE_URL }, payload: { currentPassword: "replacement-password", newPassword: "another-long-password" } });
+    expect(own.statusCode).toBe(200);
+    expect((await app.inject({ url: "/v1/admin/me", headers: { cookie: newLogin.headers["set-cookie"] as string } })).statusCode).toBe(401);
+    await app.close();
+  });
+
+  it("filters active tenants and returns paginated tenant forms", async () => {
+    const store = new MemoryStore(); const { app, body } = await createTestForm(store);
+    const headers = { authorization: `Bearer ${config.ADMIN_API_KEY}` };
+    await store.createTenant("Empty workspace");
+    const active = await app.inject({ url: "/v1/admin/tenants?status=active", headers });
+    expect(active.json().tenants).toHaveLength(1);
+    const id = store.forms.get(body.publicKey)!.tenantId;
+    const detail = await app.inject({ url: `/v1/admin/tenants/${id}?limit=1&status=active`, headers });
+    expect(detail.json().forms[0].publicKey).toBe(body.publicKey);
+    expect(detail.headers["cache-control"]).toBe("no-store");
+    await app.close();
+  });
+
   it("lets tenant admins edit their forms and enforces their form allowance", async () => {
     const store = new MemoryStore();
     const app = buildApp(config, store);

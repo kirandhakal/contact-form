@@ -1,4 +1,5 @@
 import pg from "pg";
+import type { ListQuery, PageResult } from "../management.js";
 import type {
   CreateFormInput,
   AdminRole,
@@ -292,7 +293,73 @@ export class PostgresStore implements Store {
   }
 
   async updateAdminPassword(adminId: string, passwordHash: string): Promise<void> {
-    await this.pool.query("update admin_users set password_hash = $2 where id = $1", [adminId, passwordHash]);
+    const client = await this.pool.connect();
+    try {
+      await client.query("begin");
+      await client.query("update admin_users set password_hash = $2 where id = $1", [adminId, passwordHash]);
+      await client.query("delete from admin_sessions where admin_id = $1", [adminId]);
+      await client.query("commit");
+    } catch (error) { await client.query("rollback"); throw error; }
+    finally { client.release(); }
+  }
+
+  async managementPage(resource: "forms" | "tenants" | "submissions", query: ListQuery, publicKey?: string): Promise<PageResult> {
+    const values: unknown[] = [];
+    const bind = (value: unknown) => { values.push(value); return `$${values.length}`; };
+    const where: string[] = [];
+    let source: string;
+    if (resource === "submissions") {
+      where.push(`f.public_key = ${bind(publicKey)}`, "s.status <> 'deleted'");
+      if (query.tenantId) where.push(`s.tenant_id = ${bind(query.tenantId)}`);
+      if (query.status) where.push(`s.status = ${bind(query.status)}`);
+      if (query.q) where.push(`s.payload::text ilike ${bind(`%${query.q}%`)}`);
+      if (query.from) where.push(`s.created_at >= ${bind(query.from)}::timestamptz`);
+      if (query.to) where.push(`s.created_at <= ${bind(query.to)}::timestamptz`);
+      source = `select s.id, s.created_at, '' as name, 0 as usage, jsonb_build_object('id',s.id,'payload',s.payload,'status',s.status,'createdAt',s.created_at,'sourceOrigin',s.source_origin) as item from submissions s join forms f on f.id=s.form_id where ${where.join(" and ")}`;
+    } else if (resource === "forms") {
+      if (query.tenantId) where.push(`f.tenant_id = ${bind(query.tenantId)}`);
+      if (query.status) where.push(`f.status = ${bind(query.status)}`);
+      if (query.q) where.push(`(f.name ilike ${bind(`%${query.q}%`)} or f.public_key ilike $${values.length})`);
+      const dates = ["s.form_id=f.id", "s.status <> 'deleted'"];
+      if (query.from) dates.push(`s.created_at >= ${bind(query.from)}::timestamptz`);
+      if (query.to) dates.push(`s.created_at <= ${bind(query.to)}::timestamptz`);
+      source = `select f.id, f.created_at, f.name, stats.total as usage,
+        jsonb_build_object('publicKey',f.public_key,'tenantId',f.tenant_id,'tenantName',t.name,'name',f.name,'status',f.status,'allowedOrigins',f.allowed_origins,'submissionCount',stats.total,'acceptedCount',stats.accepted,'spamCount',stats.spam,'lastSubmittedAt',stats.last_at,'schema',v.schema,'successMessage',f.success_message) as item
+        from forms f join tenants t on t.id=f.tenant_id
+        join lateral (select schema from form_versions where form_id=f.id order by version desc limit 1) v on true
+        cross join lateral (select count(*)::int total, count(*) filter(where s.status='accepted')::int accepted, count(*) filter(where s.status='spam')::int spam, max(s.created_at) last_at from submissions s where ${dates.join(" and ")}) stats
+        ${where.length ? `where ${where.join(" and ")}` : ""}`;
+    } else {
+      if (query.tenantId) where.push(`t.id = ${bind(query.tenantId)}`);
+      if (query.q) where.push(`t.name ilike ${bind(`%${query.q}%`)}`);
+      if (query.status) where.push(`${query.status === "inactive" ? "not " : ""}exists(select 1 from forms where tenant_id=t.id and status='active')`);
+      source = `select t.id,t.created_at,t.name,stats.total as usage,
+        jsonb_build_object('id',t.id,'name',t.name,'createdAt',t.created_at,'formCount',(select count(*) from forms where tenant_id=t.id),'activeFormCount',(select count(*) from forms where tenant_id=t.id and status='active'),'totalSubmissions',stats.total,'dailySubmissions',stats.daily,'maxForms',t.max_forms,'maxOriginsPerForm',t.max_origins_per_form,'maxTotalSubmissions',t.max_total_submissions,'maxDailySubmissions',t.max_daily_submissions) as item
+        from tenants t cross join lateral (select count(*)::int total, count(*) filter(where created_at >= date_trunc('day',now()))::int daily from submissions where tenant_id=t.id and status <> 'deleted') stats
+        ${where.length ? `where ${where.join(" and ")}` : ""}`;
+    }
+    const order = { newest: "created_at desc,id", oldest: "created_at asc,id", name: "name asc,id", "most-used": "usage desc,id" }[query.sort];
+    const limit = bind(query.limit), offset = bind((query.page - 1) * query.limit);
+    const result = await this.pool.query(`with filtered as (${source}), page as (select * from filtered order by ${order} limit ${limit} offset ${offset}) select (select count(*)::int from filtered) total, coalesce((select jsonb_agg(item order by ${order}) from page),'[]'::jsonb) items`, values);
+    const { items, total } = result.rows[0];
+    return { items, pagination: { page: query.page, limit: query.limit, total, pages: Math.ceil(total / query.limit) } };
+  }
+
+  async analytics(tenantId?: string, from?: string, to?: string): Promise<JsonObject> {
+    const result = await this.pool.query(`with scoped_forms as (select * from forms where ($1::uuid is null or tenant_id=$1)), scoped_submissions as (
+      select s.* from submissions s join scoped_forms f on f.id=s.form_id where s.status <> 'deleted' and ($2::timestamptz is null or s.created_at >= $2) and ($3::timestamptz is null or s.created_at <= $3)
+    ) select jsonb_build_object(
+      'forms',(select count(*) from scoped_forms),
+      'activeForms',(select count(*) from scoped_forms where status='active'),
+      'tenants',(select count(*) from tenants where ($1::uuid is null or id=$1)),
+      'activeTenants',(select count(distinct tenant_id) from scoped_forms where status='active'),
+      'submissions',(select count(*) from scoped_submissions),
+      'accepted',(select count(*) from scoped_submissions where status='accepted'),
+      'spam',(select count(*) from scoped_submissions where status='spam'),
+      'mostUsedForms',coalesce((select jsonb_agg(row_to_json(top_forms)) from (select f.public_key as "publicKey", f.name, count(s.id)::int as "submissionCount" from scoped_forms f left join scoped_submissions s on s.form_id=f.id group by f.id,f.public_key,f.name order by count(s.id) desc,f.id limit 10) top_forms),'[]'::jsonb),
+      'daily',coalesce((select jsonb_agg(row_to_json(days)) from (select to_char(created_at at time zone 'UTC','YYYY-MM-DD') as day,count(*)::int as count from scoped_submissions group by day order by day) days),'[]'::jsonb)
+    ) as data`, [tenantId ?? null, from ?? null, to ?? null]);
+    return result.rows[0].data;
   }
 
   async createTenant(name: string): Promise<string> {

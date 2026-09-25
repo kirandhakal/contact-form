@@ -1,7 +1,6 @@
 import { createRequire } from "node:module";
-import { readFile } from "node:fs/promises";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { z } from "zod";
+import { listQuery } from "./management.js";
 import { Ajv2020, type ErrorObject } from "ajv/dist/2020.js";
 import type { FormatsPlugin } from "ajv-formats";
 import Fastify, { type FastifyError, type FastifyReply } from "fastify";
@@ -121,12 +120,8 @@ export function buildApp(config: AppConfig, store: Store) {
   const limiter = new FixedWindowRateLimiter(config.RATE_LIMIT_WINDOW_SECONDS * 1000, config.RATE_LIMIT_MAX);
   const loginLimiter = new FixedWindowRateLimiter(15 * 60 * 1000, 10);
   const signupLimiter = new FixedWindowRateLimiter(60 * 60 * 1000, 5);
-
-  async function sendPublicPage(reply: FastifyReply, filename: string) {
-    const path = join(dirname(fileURLToPath(import.meta.url)), "..", "public", filename);
-    reply.header("Cache-Control", "no-store");
-    return reply.type("text/html; charset=utf-8").send(await readFile(path, "utf8"));
-  }
+  const authTrafficLimiter = new FixedWindowRateLimiter(15 * 60 * 1000, 300);
+  const passwordLimiter = new FixedWindowRateLimiter(15 * 60 * 1000, 10);
 
   async function adminFor(request: { headers: Record<string, unknown> }) {
     const auth = request.headers.authorization;
@@ -143,8 +138,9 @@ export function buildApp(config: AppConfig, store: Store) {
     return typeof origin === "string" && origin === new URL(config.PUBLIC_BASE_URL).origin;
   }
 
-  app.addHook("onSend", async (_request, reply) => {
+  app.addHook("onSend", async (request, reply) => {
     applySecurityHeaders(reply);
+    if (request.url.startsWith("/v1/admin") || request.url.startsWith("/v1/auth")) reply.header("Cache-Control", "no-store");
   });
 
   app.setErrorHandler((error: FastifyError, _request, reply) => {
@@ -154,6 +150,10 @@ export function buildApp(config: AppConfig, store: Store) {
     }
     if (error.validation) {
       void problem(reply, 400, "Malformed request", "Request body is invalid.");
+      return;
+    }
+    if (error.statusCode && error.statusCode >= 400 && error.statusCode < 500) {
+      void problem(reply, error.statusCode, "Invalid request", error.message);
       return;
     }
     app.log.error(error);
@@ -167,16 +167,7 @@ export function buildApp(config: AppConfig, store: Store) {
 
   app.get("/health/live", async () => ({ status: "ok" }));
 
-  app.get("/", async (_request, reply) => reply.redirect("/auth"));
-  app.get("/auth", async (_request, reply) => sendPublicPage(reply, "auth.html"));
-  app.get("/auth/admin", async (_request, reply) => sendPublicPage(reply, "auth.html"));
-  app.get("/dashboard", async (_request, reply) => sendPublicPage(reply, "admin.html"));
-  app.get("/admin-v2.js", async (_request, reply) => {
-    const path = join(dirname(fileURLToPath(import.meta.url)), "..", "public", "admin-v2.js");
-    reply.header("Cache-Control", "no-store");
-    return reply.type("text/javascript; charset=utf-8").send(await readFile(path, "utf8"));
-  });
-  app.get("/admin", async (_request, reply) => reply.redirect("/auth/admin"));
+  app.get("/", async () => ({ service: "Contact API", health: "/health/ready" }));
 
   app.get("/health/ready", async (_request, reply) => {
     if (await store.ready()) return { status: "ok" };
@@ -185,11 +176,13 @@ export function buildApp(config: AppConfig, store: Store) {
 
   app.post("/v1/admin/login", async (request, reply) => {
     if (!sameOrigin(request)) return problem(reply, 403, "Forbidden", "Use the hosted admin page.");
-    const limit = loginLimiter.check(request.ip);
+    const limit = authTrafficLimiter.check(request.ip);
     if (!limit.allowed) return problem(reply, 429, "Too many attempts", "Try again later.");
     if (!assertPlainObject(request.body) || typeof request.body.email !== "string" ||
       typeof request.body.password !== "string") return problem(reply, 400, "Invalid request", "Email and password are required.");
     const email = request.body.email.trim().toLowerCase();
+    if (email.length > 254 || request.body.password.length > 256) return problem(reply, 400, "Invalid request", "Invalid credentials.");
+    if (!loginLimiter.check(email).allowed) return problem(reply, 429, "Too many attempts", "Try again later.");
     const admin = await store.getAdminByEmail(email);
     if (!admin || !(await verifyPassword(request.body.password, admin.passwordHash))) {
       return problem(reply, 401, "Unauthorized", "Invalid email or password.");
@@ -204,7 +197,7 @@ export function buildApp(config: AppConfig, store: Store) {
 
   app.post("/v1/auth/signup", async (request, reply) => {
     if (!sameOrigin(request)) return problem(reply, 403, "Forbidden", "Use the hosted signup page.");
-    const limit = signupLimiter.check(request.ip);
+    const limit = authTrafficLimiter.check(request.ip);
     if (!limit.allowed) return problem(reply, 429, "Too many attempts", "Try again later.");
     if (!assertPlainObject(request.body) || typeof request.body.workspaceName !== "string" ||
       typeof request.body.email !== "string" || typeof request.body.password !== "string") {
@@ -217,6 +210,7 @@ export function buildApp(config: AppConfig, store: Store) {
       email.length > 254 || password.length < 12 || password.length > 256) {
       return problem(reply, 422, "Invalid request", "Use a valid workspace, email, and password of at least 12 characters.");
     }
+    if (!signupLimiter.check(email).allowed) return problem(reply, 429, "Too many attempts", "Try again later.");
     try {
       const account = await store.createSiteAccount(workspaceName, email, await hashPassword(password));
       return reply.code(201).send({ email, role: "tenant", tenantId: account.tenantId });
@@ -285,6 +279,7 @@ export function buildApp(config: AppConfig, store: Store) {
     if (!sameOrigin(request)) return problem(reply, 403, "Forbidden", "Invalid origin.");
     const actor = await adminFor(request);
     if (!actor || actor.id === "service-key") return problem(reply, 401, "Unauthorized", "Sign in required.");
+    if (!passwordLimiter.check(actor.id).allowed) return problem(reply, 429, "Too many attempts", "Try again later.");
     if (!assertPlainObject(request.body) || typeof request.body.currentPassword !== "string" || typeof request.body.newPassword !== "string" ||
       request.body.newPassword.length < 12 || request.body.newPassword.length > 256) {
       return problem(reply, 422, "Invalid request", "Current password and a new password of at least 12 characters are required.");
@@ -301,7 +296,72 @@ export function buildApp(config: AppConfig, store: Store) {
     const actor = await adminFor(request);
     if (!actor) return problem(reply, 401, "Unauthorized", "Sign in required.");
     if (actor.role === "tenant") return problem(reply, 403, "Forbidden", "Tenant management requires a super or sudo admin.");
-    return { tenants: await store.listTenants() };
+    const parsed = listQuery.safeParse(request.query);
+    if (!parsed.success || (parsed.data.status && !["active", "inactive"].includes(parsed.data.status))) return problem(reply, 400, "Invalid filters", "Use valid pagination and active/inactive status.");
+    const result = await store.managementPage("tenants", parsed.data);
+    return { tenants: result.items, pagination: result.pagination };
+  });
+
+  app.get("/v1/admin/forms", async (request, reply) => {
+    const actor = await adminFor(request);
+    if (!actor) return problem(reply, 401, "Unauthorized", "Sign in required.");
+    const parsed = listQuery.safeParse(request.query);
+    if (!parsed.success || (parsed.data.status && !["active", "disabled"].includes(parsed.data.status))) return problem(reply, 400, "Invalid filters", "Use valid pagination and active/disabled status.");
+    if (actor.role === "tenant") parsed.data.tenantId = actor.tenantId!;
+    const result = await store.managementPage("forms", parsed.data);
+    return { forms: result.items, pagination: result.pagination };
+  });
+
+  app.get("/v1/admin/analytics", async (request, reply) => {
+    const actor = await adminFor(request);
+    if (!actor) return problem(reply, 401, "Unauthorized", "Sign in required.");
+    const parsed = listQuery.safeParse(request.query);
+    if (!parsed.success) return problem(reply, 400, "Invalid filters", "Use valid tenant and ISO date filters.");
+    const tenantId = actor.role === "tenant" ? actor.tenantId! : parsed.data.tenantId;
+    return store.analytics(tenantId, parsed.data.from, parsed.data.to);
+  });
+
+  app.get<{ Params: { tenantId: string } }>("/v1/admin/tenants/:tenantId", async (request, reply) => {
+    const actor = await adminFor(request);
+    if (!actor) return problem(reply, 401, "Unauthorized", "Sign in required.");
+    if (!z.string().uuid().safeParse(request.params.tenantId).success) return problem(reply, 400, "Invalid tenant", "Tenant ID must be a UUID.");
+    if (actor.role === "tenant" && actor.tenantId !== request.params.tenantId) return problem(reply, 404, "Not found", "Tenant not found.");
+    const parsed = listQuery.safeParse(request.query);
+    if (!parsed.success || (parsed.data.status && !["active", "disabled"].includes(parsed.data.status))) return problem(reply, 400, "Invalid filters", "Invalid form filters.");
+    const tenantId = request.params.tenantId;
+    const tenants = await store.managementPage("tenants", { page: 1, limit: 1, q: "", sort: "newest", tenantId });
+    if (!tenants.items.length) return problem(reply, 404, "Not found", "Tenant not found.");
+    const forms = await store.managementPage("forms", { ...parsed.data, tenantId });
+    return { tenant: tenants.items[0], forms: forms.items, pagination: forms.pagination };
+  });
+
+  app.post("/v1/admin/tenants", async (request, reply) => {
+    const actor = await adminFor(request);
+    if (!actor) return problem(reply, 401, "Unauthorized", "Sign in required.");
+    if (actor.id !== "service-key" && !sameOrigin(request)) return problem(reply, 403, "Forbidden", "Invalid origin.");
+    if (actor.role === "tenant") return problem(reply, 403, "Forbidden", "Tenant management requires a super or sudo admin.");
+    const parsed = z.object({ name: z.string().trim().min(1).max(200), email: z.string().trim().email().max(254).transform(v => v.toLowerCase()), password: z.string().min(12).max(256) }).safeParse(request.body);
+    if (!parsed.success) return problem(reply, 422, "Invalid tenant", "Name, valid email, and a 12–256 character password are required.");
+    try {
+      const account = await store.createSiteAccount(parsed.data.name, parsed.data.email, await hashPassword(parsed.data.password));
+      return reply.code(201).send({ ...account, name: parsed.data.name, email: parsed.data.email });
+    } catch (error) {
+      if (typeof error === "object" && error && "code" in error && error.code === "23505") return problem(reply, 409, "Conflict", "This email already has an account.");
+      throw error;
+    }
+  });
+
+  app.post<{ Params: { tenantId: string } }>("/v1/admin/tenants/:tenantId/password", async (request, reply) => {
+    const actor = await adminFor(request);
+    if (!actor) return problem(reply, 401, "Unauthorized", "Sign in required.");
+    if (actor.id !== "service-key" && !sameOrigin(request)) return problem(reply, 403, "Forbidden", "Invalid origin.");
+    if (actor.role === "tenant") return problem(reply, 403, "Forbidden", "Use the current-password flow for your own account.");
+    const parsed = z.object({ email: z.string().trim().email().transform(v => v.toLowerCase()), newPassword: z.string().min(12).max(256) }).safeParse(request.body);
+    if (!parsed.success || !z.string().uuid().safeParse(request.params.tenantId).success) return problem(reply, 422, "Invalid request", "Valid tenant, email, and 12–256 character password required.");
+    const account = await store.getAdminByEmail(parsed.data.email);
+    if (!account || account.role !== "tenant" || account.tenantId !== request.params.tenantId) return problem(reply, 404, "Not found", "Tenant account not found.");
+    await store.updateAdminPassword(account.id, await hashPassword(parsed.data.newPassword));
+    return { ok: true };
   });
 
   app.patch<{ Params: { tenantId: string } }>("/v1/admin/tenants/:tenantId", async (request, reply) => {
@@ -313,7 +373,7 @@ export function buildApp(config: AppConfig, store: Store) {
     const keys = ["maxOriginsPerForm", "maxForms", "maxTotalSubmissions", "maxDailySubmissions"] as const;
     const limitBody = request.body as JsonObject;
     const limits = Object.fromEntries(keys.map((key) => [key, Number(limitBody[key])])) as unknown as TenantLimits;
-    if (keys.some((key) => !Number.isInteger(limits[key]) || limits[key] < 1)) {
+    if (!z.string().uuid().safeParse(request.params.tenantId).success || keys.some((key) => !Number.isInteger(limits[key]) || limits[key] < 1 || limits[key] > 2147483647)) {
       return problem(reply, 422, "Invalid request", "All limits must be positive integers.");
     }
     if (!(await store.updateTenantLimits(request.params.tenantId, limits))) return problem(reply, 404, "Not found", "Tenant not found.");
@@ -350,6 +410,8 @@ export function buildApp(config: AppConfig, store: Store) {
       if (destination.kind === "webhook" && !isSafeWebhookUrl(destination.config.url)) {
         return problem(reply, 422, "Validation failed", "Webhook destinations require a safe HTTPS URL.");
       }
+      if (destination.kind === "webhook" && (!destination.secret || destination.secret.length < 24)) return problem(reply, 422, "Validation failed", "Webhooks require a signing secret of at least 24 characters.");
+      if (destination.kind === "email" && !z.string().email().safeParse(destination.config.to).success) return problem(reply, 422, "Validation failed", "Email destinations require a valid recipient.");
     }
     if (!schemaAjv.validateSchema(input.schema)) {
       return problem(reply, 422, "Validation failed", "JSON Schema is invalid.", {
@@ -548,9 +610,11 @@ export function buildApp(config: AppConfig, store: Store) {
       if (!tenantId || (admin.role === "tenant" && tenantId !== admin.tenantId)) {
         return problem(reply, 404, "Not found", "Form not found.");
       }
-      const limit = Math.min(Math.max(Number(request.query.limit ?? 50) || 50, 1), 200);
+      const parsed = listQuery.safeParse(request.query);
+      if (!parsed.success || (parsed.data.status && !["accepted", "spam"].includes(parsed.data.status))) return problem(reply, 400, "Invalid filters", "Use valid pagination, dates, and accepted/spam status.");
       reply.header("Cache-Control", "no-store");
-      return { submissions: await store.listSubmissions(request.params.publicKey, limit) };
+      const result = await store.managementPage("submissions", { ...parsed.data, tenantId }, request.params.publicKey);
+      return { submissions: result.items, pagination: result.pagination };
     }
   );
 

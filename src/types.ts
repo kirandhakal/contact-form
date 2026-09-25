@@ -122,6 +122,8 @@ export interface OutboxJob {
 }
 
 export interface Store {
+  managementPage(resource: "forms" | "tenants" | "submissions", query: import("./management.js").ListQuery, publicKey?: string): Promise<import("./management.js").PageResult>;
+  analytics(tenantId?: string, from?: string, to?: string): Promise<JsonObject>;
   ready(): Promise<boolean>;
   createSiteAccount(tenantName: string, email: string, passwordHash: string): Promise<{ tenantId: string }>;
   createForm(input: CreateFormInput, publicKey: string): Promise<FormRecord>;
