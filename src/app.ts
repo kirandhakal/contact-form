@@ -187,6 +187,14 @@ export function buildApp(config: AppConfig, store: Store) {
     if (!admin || !(await verifyPassword(request.body.password, admin.passwordHash))) {
       return problem(reply, 401, "Unauthorized", "Invalid email or password.");
     }
+    const portal = request.body.portal === "admin" || request.body.portal === "tenant" ? request.body.portal : null;
+    const isStaff = admin.role === "sudo" || admin.role === "super";
+    if (portal === "admin" && !isStaff) {
+      return problem(reply, 403, "Forbidden", "Workspace accounts sign in at /login.");
+    }
+    if (portal === "tenant" && isStaff) {
+      return problem(reply, 403, "Forbidden", "Service admins sign in at /auth/admin.");
+    }
     const token = newSessionToken();
     await store.createAdminSession(admin.id, hashSessionToken(token), new Date(Date.now() + 8 * 60 * 60 * 1000));
     const secure = new URL(config.PUBLIC_BASE_URL).protocol === "https:" ? "; Secure" : "";
@@ -207,8 +215,8 @@ export function buildApp(config: AppConfig, store: Store) {
     const email = request.body.email.trim().toLowerCase();
     const password = request.body.password;
     if (!workspaceName || workspaceName.length > 200 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) ||
-      email.length > 254 || password.length < 12 || password.length > 256) {
-      return problem(reply, 422, "Invalid request", "Use a valid workspace, email, and password of at least 12 characters.");
+      email.length > 254 || password.length < 8 || password.length > 256) {
+      return problem(reply, 422, "Invalid request", "Use a valid workspace, email, and password of at least 8 characters.");
     }
     if (!signupLimiter.check(email).allowed) return problem(reply, 429, "Too many attempts", "Try again later.");
     try {
@@ -249,7 +257,7 @@ export function buildApp(config: AppConfig, store: Store) {
     }
     const { email, password } = request.body;
     const role = request.body.role === "service" ? "super" : request.body.role === "site" ? "tenant" : request.body.role;
-    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || email.length > 254 || password.length < 12 || password.length > 256 ||
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || email.length > 254 || password.length < 8 || password.length > 256 ||
       !["super", "tenant"].includes(String(role))) return problem(reply, 422, "Invalid request", "Invalid email, password, or role.");
     if (role === "super" && actor.role !== "sudo") return problem(reply, 403, "Forbidden", "Only sudo admins can create super admins.");
     if (actor.role === "tenant" && role !== "tenant") return problem(reply, 403, "Forbidden", "Tenant admins can add tenant admins only.");
@@ -281,8 +289,8 @@ export function buildApp(config: AppConfig, store: Store) {
     if (!actor || actor.id === "service-key") return problem(reply, 401, "Unauthorized", "Sign in required.");
     if (!passwordLimiter.check(actor.id).allowed) return problem(reply, 429, "Too many attempts", "Try again later.");
     if (!assertPlainObject(request.body) || typeof request.body.currentPassword !== "string" || typeof request.body.newPassword !== "string" ||
-      request.body.newPassword.length < 12 || request.body.newPassword.length > 256) {
-      return problem(reply, 422, "Invalid request", "Current password and a new password of at least 12 characters are required.");
+      request.body.newPassword.length < 8 || request.body.newPassword.length > 256) {
+      return problem(reply, 422, "Invalid request", "Current password and a new password of at least 8 characters are required.");
     }
     const account = await store.getAdminByEmail(actor.email);
     if (!account || !(await verifyPassword(request.body.currentPassword, account.passwordHash))) {
@@ -340,8 +348,8 @@ export function buildApp(config: AppConfig, store: Store) {
     if (!actor) return problem(reply, 401, "Unauthorized", "Sign in required.");
     if (actor.id !== "service-key" && !sameOrigin(request)) return problem(reply, 403, "Forbidden", "Invalid origin.");
     if (actor.role === "tenant") return problem(reply, 403, "Forbidden", "Tenant management requires a super or sudo admin.");
-    const parsed = z.object({ name: z.string().trim().min(1).max(200), email: z.string().trim().email().max(254).transform(v => v.toLowerCase()), password: z.string().min(12).max(256) }).safeParse(request.body);
-    if (!parsed.success) return problem(reply, 422, "Invalid tenant", "Name, valid email, and a 12–256 character password are required.");
+    const parsed = z.object({ name: z.string().trim().min(1).max(200), email: z.string().trim().email().max(254).transform(v => v.toLowerCase()), password: z.string().min(8).max(256) }).safeParse(request.body);
+    if (!parsed.success) return problem(reply, 422, "Invalid tenant", "Name, valid email, and an 8–256 character password are required.");
     try {
       const account = await store.createSiteAccount(parsed.data.name, parsed.data.email, await hashPassword(parsed.data.password));
       return reply.code(201).send({ ...account, name: parsed.data.name, email: parsed.data.email });
@@ -356,8 +364,8 @@ export function buildApp(config: AppConfig, store: Store) {
     if (!actor) return problem(reply, 401, "Unauthorized", "Sign in required.");
     if (actor.id !== "service-key" && !sameOrigin(request)) return problem(reply, 403, "Forbidden", "Invalid origin.");
     if (actor.role === "tenant") return problem(reply, 403, "Forbidden", "Use the current-password flow for your own account.");
-    const parsed = z.object({ email: z.string().trim().email().transform(v => v.toLowerCase()), newPassword: z.string().min(12).max(256) }).safeParse(request.body);
-    if (!parsed.success || !z.string().uuid().safeParse(request.params.tenantId).success) return problem(reply, 422, "Invalid request", "Valid tenant, email, and 12–256 character password required.");
+    const parsed = z.object({ email: z.string().trim().email().transform(v => v.toLowerCase()), newPassword: z.string().min(8).max(256) }).safeParse(request.body);
+    if (!parsed.success || !z.string().uuid().safeParse(request.params.tenantId).success) return problem(reply, 422, "Invalid request", "Valid tenant, email, and 8–256 character password required.");
     const account = await store.getAdminByEmail(parsed.data.email);
     if (!account || account.role !== "tenant" || account.tenantId !== request.params.tenantId) return problem(reply, 404, "Not found", "Tenant account not found.");
     await store.updateAdminPassword(account.id, await hashPassword(parsed.data.newPassword));
