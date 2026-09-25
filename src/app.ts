@@ -20,7 +20,7 @@ import {
   newPublicKey,
   newSubmissionAccessToken
 } from "./security.js";
-import type { CreateFormInput, JsonObject, Store } from "./types.js";
+import type { AdminRole, CreateFormInput, JsonObject, Store, TenantLimits } from "./types.js";
 
 const require = createRequire(import.meta.url);
 const addFormats = require("ajv-formats") as FormatsPlugin;
@@ -131,7 +131,7 @@ export function buildApp(config: AppConfig, store: Store) {
   async function adminFor(request: { headers: Record<string, unknown> }) {
     const auth = request.headers.authorization;
     if (typeof auth === "string" && constantTimeEqual(auth, `Bearer ${config.ADMIN_API_KEY}`)) {
-      return { id: "service-key", email: "service-key", role: "service" as const, tenantId: null };
+      return { id: "service-key", email: "service-key", role: "sudo" as const, tenantId: null };
     }
     const cookie = request.headers.cookie;
     const token = typeof cookie === "string" ? /(?:^|;\s*)contact_admin=([A-Za-z0-9_-]{43})/.exec(cookie)?.[1] : undefined;
@@ -171,6 +171,11 @@ export function buildApp(config: AppConfig, store: Store) {
   app.get("/auth", async (_request, reply) => sendPublicPage(reply, "auth.html"));
   app.get("/auth/admin", async (_request, reply) => sendPublicPage(reply, "auth.html"));
   app.get("/dashboard", async (_request, reply) => sendPublicPage(reply, "admin.html"));
+  app.get("/admin-v2.js", async (_request, reply) => {
+    const path = join(dirname(fileURLToPath(import.meta.url)), "..", "public", "admin-v2.js");
+    reply.header("Cache-Control", "no-store");
+    return reply.type("text/javascript; charset=utf-8").send(await readFile(path, "utf8"));
+  });
   app.get("/admin", async (_request, reply) => reply.redirect("/auth/admin"));
 
   app.get("/health/ready", async (_request, reply) => {
@@ -214,7 +219,7 @@ export function buildApp(config: AppConfig, store: Store) {
     }
     try {
       const account = await store.createSiteAccount(workspaceName, email, await hashPassword(password));
-      return reply.code(201).send({ email, role: "site", tenantId: account.tenantId });
+      return reply.code(201).send({ email, role: "tenant", tenantId: account.tenantId });
     } catch (error) {
       if (typeof error === "object" && error !== null && "code" in error && error.code === "23505") {
         return problem(reply, 409, "Account exists", "An account with this email already exists.");
@@ -248,17 +253,25 @@ export function buildApp(config: AppConfig, store: Store) {
       typeof request.body.password !== "string" || typeof request.body.role !== "string") {
       return problem(reply, 400, "Invalid request", "Email, password, and role are required.");
     }
-    const { email, password, role } = request.body;
+    const { email, password } = request.body;
+    const role = request.body.role === "service" ? "super" : request.body.role === "site" ? "tenant" : request.body.role;
     if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || email.length > 254 || password.length < 12 || password.length > 256 ||
-      !["service", "site"].includes(role)) return problem(reply, 422, "Invalid request", "Invalid email, password, or role.");
-    if (actor.role !== "service" && role !== "site") return problem(reply, 403, "Forbidden", "Site admins can add site admins only.");
+      !["super", "tenant"].includes(String(role))) return problem(reply, 422, "Invalid request", "Invalid email, password, or role.");
+    if (role === "super" && actor.role !== "sudo") return problem(reply, 403, "Forbidden", "Only sudo admins can create super admins.");
+    if (actor.role === "tenant" && role !== "tenant") return problem(reply, 403, "Forbidden", "Tenant admins can add tenant admins only.");
     const formKey = request.body.formKey;
-    const tenantId = role === "site"
-      ? actor.role === "site" ? actor.tenantId : typeof formKey === "string" ? await store.getTenantIdForForm(formKey) : null
+    let requestedTenantId = typeof request.body.tenantId === "string" ? request.body.tenantId : null;
+    if (role === "tenant" && !requestedTenantId && typeof request.body.tenantName === "string" && actor.role === "sudo") {
+      const tenantName = request.body.tenantName.trim();
+      if (!tenantName || tenantName.length > 200) return problem(reply, 422, "Invalid request", "A valid tenant name is required.");
+      requestedTenantId = await store.createTenant(tenantName);
+    }
+    const tenantId = role === "tenant"
+      ? actor.role === "tenant" ? actor.tenantId : requestedTenantId ?? (typeof formKey === "string" ? await store.getTenantIdForForm(formKey) : null)
       : null;
-    if (role === "site" && !tenantId) return problem(reply, 422, "Invalid request", "A registered form key is required.");
+    if (role === "tenant" && !tenantId) return problem(reply, 422, "Invalid request", "A tenant, tenantId, or registered form key is required.");
     try {
-      await store.createAdmin(email.trim().toLowerCase(), await hashPassword(password), role as "service" | "site", tenantId);
+      await store.createAdmin(email.trim().toLowerCase(), await hashPassword(password), role as AdminRole, tenantId);
     } catch (error) {
       if (typeof error === "object" && error !== null && "code" in error && error.code === "23505") {
         return problem(reply, 409, "Conflict", "This email already has an account.");
@@ -266,6 +279,45 @@ export function buildApp(config: AppConfig, store: Store) {
       throw error;
     }
     return reply.code(201).send({ email: email.trim().toLowerCase(), role, tenantId });
+  });
+
+  app.post("/v1/admin/password", async (request, reply) => {
+    if (!sameOrigin(request)) return problem(reply, 403, "Forbidden", "Invalid origin.");
+    const actor = await adminFor(request);
+    if (!actor || actor.id === "service-key") return problem(reply, 401, "Unauthorized", "Sign in required.");
+    if (!assertPlainObject(request.body) || typeof request.body.currentPassword !== "string" || typeof request.body.newPassword !== "string" ||
+      request.body.newPassword.length < 12 || request.body.newPassword.length > 256) {
+      return problem(reply, 422, "Invalid request", "Current password and a new password of at least 12 characters are required.");
+    }
+    const account = await store.getAdminByEmail(actor.email);
+    if (!account || !(await verifyPassword(request.body.currentPassword, account.passwordHash))) {
+      return problem(reply, 401, "Unauthorized", "Current password is incorrect.");
+    }
+    await store.updateAdminPassword(actor.id, await hashPassword(request.body.newPassword));
+    return { ok: true };
+  });
+
+  app.get("/v1/admin/tenants", async (request, reply) => {
+    const actor = await adminFor(request);
+    if (!actor) return problem(reply, 401, "Unauthorized", "Sign in required.");
+    if (actor.role === "tenant") return problem(reply, 403, "Forbidden", "Tenant management requires a super or sudo admin.");
+    return { tenants: await store.listTenants() };
+  });
+
+  app.patch<{ Params: { tenantId: string } }>("/v1/admin/tenants/:tenantId", async (request, reply) => {
+    if (!sameOrigin(request)) return problem(reply, 403, "Forbidden", "Invalid origin.");
+    const actor = await adminFor(request);
+    if (!actor) return problem(reply, 401, "Unauthorized", "Sign in required.");
+    if (actor.role === "tenant") return problem(reply, 403, "Forbidden", "Tenant management requires a super or sudo admin.");
+    if (!assertPlainObject(request.body)) return problem(reply, 400, "Invalid request", "Permission limits are required.");
+    const keys = ["maxOriginsPerForm", "maxForms", "maxTotalSubmissions", "maxDailySubmissions"] as const;
+    const limitBody = request.body as JsonObject;
+    const limits = Object.fromEntries(keys.map((key) => [key, Number(limitBody[key])])) as unknown as TenantLimits;
+    if (keys.some((key) => !Number.isInteger(limits[key]) || limits[key] < 1)) {
+      return problem(reply, 422, "Invalid request", "All limits must be positive integers.");
+    }
+    if (!(await store.updateTenantLimits(request.params.tenantId, limits))) return problem(reply, 404, "Not found", "Tenant not found.");
+    return { tenantId: request.params.tenantId, ...limits };
   });
 
   app.post("/v1/admin/forms", async (request, reply) => {
@@ -284,9 +336,9 @@ export function buildApp(config: AppConfig, store: Store) {
         errors: validationErrors(validateCreateForm.errors)
       });
     }
-    // Site admins may add forms, but only to the tenant attached to their
+    // Tenant admins may add forms, but only to the tenant attached to their
     // account. Never trust a tenant id supplied by a browser session.
-    const input: CreateFormInput = admin.role === "site"
+    const input: CreateFormInput = admin.role === "tenant"
       ? { ...(body as CreateFormInput), tenantId: admin.tenantId ?? undefined }
       : body as CreateFormInput;
     for (const origin of input.allowedOrigins) {
@@ -303,6 +355,17 @@ export function buildApp(config: AppConfig, store: Store) {
       return problem(reply, 422, "Validation failed", "JSON Schema is invalid.", {
         errors: validationErrors(schemaAjv.errors)
       });
+    }
+
+    if (input.tenantId) {
+      const usage = await store.getTenantLimits(input.tenantId);
+      if (!usage) return problem(reply, 404, "Not found", "Tenant not found.");
+      if (input.allowedOrigins.length > usage.maxOriginsPerForm) {
+        return problem(reply, 422, "Tenant limit reached", `This tenant allows at most ${usage.maxOriginsPerForm} origins per form.`);
+      }
+      if (usage.formCount >= usage.maxForms) {
+        return problem(reply, 422, "Tenant limit reached", `This tenant allows at most ${usage.maxForms} forms.`);
+      }
     }
 
     const publicKey = newPublicKey();
@@ -339,23 +402,46 @@ export function buildApp(config: AppConfig, store: Store) {
     }
     reply.header("Cache-Control", "no-store");
     const forms = await store.listFormSummaries();
-    return { forms: admin.role === "service" ? forms : forms.filter((form) => form.tenantId === admin.tenantId) };
+    return { forms: admin.role === "tenant" ? forms.filter((form) => form.tenantId === admin.tenantId) : forms };
   });
 
   app.patch<{ Params: { publicKey: string } }>("/v1/admin/forms/:publicKey", async (request, reply) => {
     const admin = await adminFor(request);
     if (!admin) return problem(reply, 401, "Unauthorized", "Sign in required.");
     if (!sameOrigin(request) && admin.id !== "service-key") return problem(reply, 403, "Forbidden", "Invalid origin.");
-    if (!assertPlainObject(request.body) || !["active", "disabled"].includes(String(request.body.status))) {
-      return problem(reply, 422, "Invalid request", "Status must be active or disabled.");
-    }
     const tenantId = await store.getTenantIdForForm(request.params.publicKey);
-    if (!tenantId || (admin.role === "site" && tenantId !== admin.tenantId)) {
+    if (!tenantId || (admin.role === "tenant" && tenantId !== admin.tenantId)) {
       return problem(reply, 404, "Not found", "Form not found.");
     }
-    const status = request.body.status as "active" | "disabled";
-    await store.setFormStatus(request.params.publicKey, status);
-    return { publicKey: request.params.publicKey, status };
+    if (!assertPlainObject(request.body)) return problem(reply, 400, "Invalid request", "Form changes are required.");
+    const changes: Partial<Pick<CreateFormInput, "name" | "allowedOrigins" | "successMessage" | "schema">> & { status?: "active" | "disabled" } = {};
+    if (request.body.status !== undefined) {
+      if (!["active", "disabled"].includes(String(request.body.status))) return problem(reply, 422, "Invalid request", "Status must be active or disabled.");
+      changes.status = request.body.status as "active" | "disabled";
+    }
+    if (request.body.name !== undefined) {
+      if (typeof request.body.name !== "string" || !request.body.name.trim() || request.body.name.length > 200) return problem(reply, 422, "Invalid request", "A valid form name is required.");
+      changes.name = request.body.name.trim();
+    }
+    if (request.body.successMessage !== undefined) {
+      if (typeof request.body.successMessage !== "string" || !request.body.successMessage.trim() || request.body.successMessage.length > 500) return problem(reply, 422, "Invalid request", "A valid success message is required.");
+      changes.successMessage = request.body.successMessage.trim();
+    }
+    if (request.body.allowedOrigins !== undefined) {
+      if (!Array.isArray(request.body.allowedOrigins) || !request.body.allowedOrigins.length || request.body.allowedOrigins.length > 50) return problem(reply, 422, "Invalid request", "At least one allowed origin is required.");
+      const origins = request.body.allowedOrigins.map((value) => typeof value === "string" ? normalizeExactOrigin(value) : null);
+      if (origins.some((value) => !value)) return problem(reply, 422, "Invalid request", "Allowed origins must be exact HTTP or HTTPS origins.");
+      const limits = await store.getTenantLimits(tenantId);
+      if (limits && origins.length > limits.maxOriginsPerForm) return problem(reply, 422, "Tenant limit reached", `This tenant allows at most ${limits.maxOriginsPerForm} origins per form.`);
+      changes.allowedOrigins = origins as string[];
+    }
+    if (request.body.schema !== undefined) {
+      if (!assertPlainObject(request.body.schema) || !schemaAjv.validateSchema(request.body.schema)) return problem(reply, 422, "Validation failed", "JSON Schema is invalid.");
+      changes.schema = request.body.schema;
+    }
+    if (!Object.keys(changes).length) return problem(reply, 422, "Invalid request", "No supported form changes were supplied.");
+    const form = await store.updateForm(request.params.publicKey, changes);
+    return { publicKey: request.params.publicKey, form };
   });
 
   app.post<{ Params: { publicKey: string } }>("/v1/forms/:publicKey/submissions", async (request, reply) => {
@@ -363,6 +449,10 @@ export function buildApp(config: AppConfig, store: Store) {
     if (!form) return problem(reply, 404, "Not found", "Form not found or disabled.");
     if (!isAllowedOrigin(request.headers.origin, form.allowedOrigins)) {
       return problem(reply, 403, "Forbidden", "Origin is not allowed for this form.");
+    }
+    const usage = await store.getTenantLimits(form.tenantId);
+    if (usage && (usage.totalSubmissions >= usage.maxTotalSubmissions || usage.dailySubmissions >= usage.maxDailySubmissions)) {
+      return problem(reply, 429, "Submission limit reached", "This workspace has reached its submission allowance.");
     }
     applyCors(reply, request.headers.origin);
 
@@ -455,7 +545,7 @@ export function buildApp(config: AppConfig, store: Store) {
         return problem(reply, 401, "Unauthorized", "Missing or invalid admin token.");
       }
       const tenantId = await store.getTenantIdForForm(request.params.publicKey);
-      if (!tenantId || (admin.role === "site" && tenantId !== admin.tenantId)) {
+      if (!tenantId || (admin.role === "tenant" && tenantId !== admin.tenantId)) {
         return problem(reply, 404, "Not found", "Form not found.");
       }
       const limit = Math.min(Math.max(Number(request.query.limit ?? 50) || 50, 1), 200);
@@ -463,6 +553,20 @@ export function buildApp(config: AppConfig, store: Store) {
       return { submissions: await store.listSubmissions(request.params.publicKey, limit) };
     }
   );
+
+  app.patch<{ Params: { submissionId: string } }>("/v1/admin/submissions/:submissionId", async (request, reply) => {
+    if (!sameOrigin(request)) return problem(reply, 403, "Forbidden", "Invalid origin.");
+    const admin = await adminFor(request);
+    if (!admin) return problem(reply, 401, "Unauthorized", "Sign in required.");
+    if (admin.role !== "sudo") return problem(reply, 403, "Forbidden", "Only sudo admins can edit submissions.");
+    if (!assertPlainObject(request.body) || !assertPlainObject(request.body.payload) ||
+      !["accepted", "spam", "deleted"].includes(String(request.body.status))) {
+      return problem(reply, 422, "Invalid request", "A JSON payload and valid status are required.");
+    }
+    const updated = await store.updateSubmission(request.params.submissionId, request.body.payload, request.body.status as "accepted" | "spam" | "deleted");
+    if (!updated) return problem(reply, 404, "Not found", "Submission not found.");
+    return { ok: true };
+  });
 
   return app;
 }

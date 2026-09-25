@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import { buildApp } from "../src/app.js";
 import type {
   CreateFormInput,
+  AdminRole,
   FormSummary,
   FormRecord,
   JsonObject,
@@ -35,16 +36,18 @@ const config = {
 class MemoryStore implements Store {
   forms = new Map<string, FormRecord>();
   submissions: SubmissionRecord[] = [];
-  admins = new Map<string, { id: string; email: string; passwordHash: string; role: "service" | "site"; tenantId: string | null }>();
+  admins = new Map<string, { id: string; email: string; passwordHash: string; role: AdminRole; tenantId: string | null }>();
   sessions = new Map<string, string>();
+  tenants = new Map<string, { name: string; maxOriginsPerForm: number; maxForms: number; maxTotalSubmissions: number; maxDailySubmissions: number }>();
 
   async createSiteAccount(tenantName: string, email: string, passwordHash: string) {
     const tenantId = randomUUID();
-    this.admins.set(email, { id: randomUUID(), email, passwordHash, role: "site", tenantId });
+    this.tenants.set(tenantId, { name: tenantName, maxOriginsPerForm: 5, maxForms: 10, maxTotalSubmissions: 10000, maxDailySubmissions: 1000 });
+    this.admins.set(email, { id: randomUUID(), email, passwordHash, role: "tenant", tenantId });
     return { tenantId };
   }
 
-  async createAdmin(email: string, passwordHash: string, role: "service" | "site", tenantId: string | null) {
+  async createAdmin(email: string, passwordHash: string, role: AdminRole, tenantId: string | null) {
     this.admins.set(email, { id: randomUUID(), email, passwordHash, role, tenantId });
   }
   async getAdminByEmail(email: string) { return this.admins.get(email) ?? null; }
@@ -53,6 +56,31 @@ class MemoryStore implements Store {
     return [...this.admins.values()].find((admin) => admin.id === this.sessions.get(tokenHash)) ?? null;
   }
   async deleteAdminSession(tokenHash: string) { this.sessions.delete(tokenHash); }
+  async updateAdminPassword(adminId: string, passwordHash: string) {
+    const admin = [...this.admins.values()].find((item) => item.id === adminId);
+    if (admin) admin.passwordHash = passwordHash;
+  }
+  async createTenant(name: string) {
+    const id = randomUUID();
+    this.tenants.set(id, { name, maxOriginsPerForm: 5, maxForms: 10, maxTotalSubmissions: 10000, maxDailySubmissions: 1000 });
+    return id;
+  }
+  async listTenants() {
+    return [...this.tenants].map(([id, tenant]) => ({ id, ...tenant,
+      formCount: [...this.forms.values()].filter((form) => form.tenantId === id).length,
+      totalSubmissions: this.submissions.filter((item) => item.tenantId === id && item.status !== "deleted").length,
+      dailySubmissions: this.submissions.filter((item) => item.tenantId === id && item.status !== "deleted").length }));
+  }
+  async getTenantLimits(tenantId: string) {
+    const tenant = this.tenants.get(tenantId);
+    if (!tenant) return null;
+    return { ...tenant, formCount: [...this.forms.values()].filter((form) => form.tenantId === tenantId).length,
+      totalSubmissions: this.submissions.filter((item) => item.tenantId === tenantId && item.status !== "deleted").length,
+      dailySubmissions: this.submissions.filter((item) => item.tenantId === tenantId && item.status !== "deleted").length };
+  }
+  async updateTenantLimits(tenantId: string, limits: { maxOriginsPerForm: number; maxForms: number; maxTotalSubmissions: number; maxDailySubmissions: number }) {
+    const tenant = this.tenants.get(tenantId); if (!tenant) return false; Object.assign(tenant, limits); return true;
+  }
   async getTenantIdForForm(publicKey: string) { return this.forms.get(publicKey)?.tenantId ?? null; }
   async setFormStatus(publicKey: string, status: "active" | "disabled") {
     const form = this.forms.get(publicKey);
@@ -60,15 +88,31 @@ class MemoryStore implements Store {
     form.status = status;
     return true;
   }
+  async getForm(publicKey: string) { return this.forms.get(publicKey) ?? null; }
+  async updateForm(publicKey: string, input: Partial<CreateFormInput> & { status?: "active" | "disabled" }) {
+    const form = this.forms.get(publicKey); if (!form) return null;
+    if (input.name) form.name = input.name;
+    if (input.allowedOrigins) form.allowedOrigins = input.allowedOrigins;
+    if (input.successMessage) form.successMessage = input.successMessage;
+    if (input.schema) { form.schema = input.schema as JsonObject; form.version += 1; }
+    if (input.status) form.status = input.status;
+    return form;
+  }
+  async getTenantIdForSubmission(submissionId: string) { return this.submissions.find((item) => item.id === submissionId)?.tenantId ?? null; }
+  async updateSubmission(submissionId: string, payload: JsonObject, status: SubmissionStatus) {
+    const item = this.submissions.find((entry) => entry.id === submissionId); if (!item) return false;
+    item.payload = payload; item.status = status; return true;
+  }
 
   async ready() {
     return true;
   }
 
   async createForm(input: CreateFormInput, publicKey: string): Promise<FormRecord> {
+    const tenantId = input.tenantId ?? await this.createTenant(input.tenantName);
     const form: FormRecord = {
       id: randomUUID(),
-      tenantId: input.tenantId ?? randomUUID(),
+      tenantId,
       publicKey,
       name: input.name,
       status: "active",
@@ -153,6 +197,8 @@ class MemoryStore implements Store {
           spamCount: submissions.filter((item) => item.status === "spam").length,
           lastSubmittedAt: submissions.at(-1)?.createdAt,
           sourceOriginCounts
+          , successMessage: form.successMessage,
+          schema: form.schema
         };
       })
       .sort((a, b) => b.submissionCount - a.submissionCount);
@@ -201,6 +247,59 @@ async function createTestForm(store: MemoryStore) {
 }
 
 describe("contact form API", () => {
+  it("lets tenant admins edit their forms and enforces their form allowance", async () => {
+    const store = new MemoryStore();
+    const app = buildApp(config, store);
+    const signup = await app.inject({ method: "POST", url: "/v1/auth/signup", headers: { origin: config.PUBLIC_BASE_URL },
+      payload: { workspaceName: "Limited Studio", email: "limited@studio.test", password: "a-secure-password" } });
+    const tenantId = signup.json().tenantId as string;
+    await store.updateTenantLimits(tenantId, { maxOriginsPerForm: 2, maxForms: 1, maxTotalSubmissions: 10, maxDailySubmissions: 5 });
+    const login = await app.inject({ method: "POST", url: "/v1/admin/login", headers: { origin: config.PUBLIC_BASE_URL },
+      payload: { email: "limited@studio.test", password: "a-secure-password" } });
+    const headers = { cookie: login.headers["set-cookie"] as string, origin: config.PUBLIC_BASE_URL };
+    const created = await app.inject({ method: "POST", url: "/v1/admin/forms", headers, payload: {
+      tenantName: "Ignored", name: "Original", allowedOrigins: ["https://one.example"],
+      schema: { type: "object", additionalProperties: false, properties: { name: { type: "string" } } }
+    } });
+    expect(created.statusCode).toBe(201);
+    const publicKey = created.json().publicKey as string;
+    const edited = await app.inject({ method: "PATCH", url: `/v1/admin/forms/${publicKey}`, headers, payload: {
+      name: "Edited", allowedOrigins: ["https://one.example/", "https://two.example"],
+      successMessage: "Updated", schema: { type: "object", additionalProperties: false, properties: { email: { type: "string", format: "email" } } }
+    } });
+    expect(edited.statusCode).toBe(200);
+    expect(store.forms.get(publicKey)).toEqual(expect.objectContaining({ name: "Edited", version: 2,
+      allowedOrigins: ["https://one.example", "https://two.example"] }));
+    const overLimit = await app.inject({ method: "POST", url: "/v1/admin/forms", headers, payload: {
+      tenantName: "Ignored", name: "Second", allowedOrigins: ["https://one.example"],
+      schema: { type: "object", additionalProperties: false, properties: {} }
+    } });
+    expect(overLimit.statusCode).toBe(422);
+    expect(overLimit.json().title).toBe("Tenant limit reached");
+  });
+
+  it("allows super admins, but not tenant admins, to change tenant permissions", async () => {
+    const store = new MemoryStore();
+    const app = buildApp(config, store);
+    const signup = await app.inject({ method: "POST", url: "/v1/auth/signup", headers: { origin: config.PUBLIC_BASE_URL },
+      payload: { workspaceName: "Managed Studio", email: "tenant@studio.test", password: "a-secure-password" } });
+    await app.inject({ method: "POST", url: "/v1/admin/users", headers: { authorization: `Bearer ${config.ADMIN_API_KEY}` },
+      payload: { email: "super@example.com", password: "a-long-super-password", role: "super" } });
+    const superLogin = await app.inject({ method: "POST", url: "/v1/admin/login", headers: { origin: config.PUBLIC_BASE_URL },
+      payload: { email: "super@example.com", password: "a-long-super-password" } });
+    const limits = { maxOriginsPerForm: 3, maxForms: 4, maxTotalSubmissions: 500, maxDailySubmissions: 50 };
+    const changed = await app.inject({ method: "PATCH", url: `/v1/admin/tenants/${signup.json().tenantId}`,
+      headers: { origin: config.PUBLIC_BASE_URL, cookie: superLogin.headers["set-cookie"] as string }, payload: limits });
+    expect(changed.statusCode).toBe(200);
+    expect(await store.getTenantLimits(signup.json().tenantId)).toEqual(expect.objectContaining(limits));
+
+    const tenantLogin = await app.inject({ method: "POST", url: "/v1/admin/login", headers: { origin: config.PUBLIC_BASE_URL },
+      payload: { email: "tenant@studio.test", password: "a-secure-password" } });
+    const forbidden = await app.inject({ method: "PATCH", url: `/v1/admin/tenants/${signup.json().tenantId}`,
+      headers: { origin: config.PUBLIC_BASE_URL, cookie: tenantLogin.headers["set-cookie"] as string }, payload: limits });
+    expect(forbidden.statusCode).toBe(403);
+  });
+
   it("normalizes trailing slashes in allowed origins but rejects URL paths", async () => {
     const store = new MemoryStore();
     const app = buildApp(config, store);
@@ -242,7 +341,7 @@ describe("contact form API", () => {
       payload: { workspaceName: "New Studio", email: "owner@studio.test", password: "a-secure-password" }
     });
     expect(signup.statusCode).toBe(201);
-    expect(signup.json()).toEqual(expect.objectContaining({ email: "owner@studio.test", role: "site" }));
+    expect(signup.json()).toEqual(expect.objectContaining({ email: "owner@studio.test", role: "tenant" }));
 
     const login = await app.inject({
       method: "POST",
@@ -280,7 +379,7 @@ describe("contact form API", () => {
     await app.inject({
       method: "POST", url: "/v1/admin/users",
       headers: { authorization: `Bearer ${config.ADMIN_API_KEY}` },
-      payload: { email: "builder@example.com", password: "a-long-secret-password", role: "site", formKey: body.publicKey }
+      payload: { email: "builder@example.com", password: "a-long-secret-password", role: "tenant", formKey: body.publicKey }
     });
     const login = await app.inject({
       method: "POST", url: "/v1/admin/login", headers: { origin: config.PUBLIC_BASE_URL },
@@ -314,7 +413,7 @@ describe("contact form API", () => {
     const created = await app.inject({
       method: "POST", url: "/v1/admin/users",
       headers: { authorization: `Bearer ${config.ADMIN_API_KEY}` },
-      payload: { email: "owner@example.com", password: "a-long-secret-password", role: "site", formKey: body.publicKey }
+      payload: { email: "owner@example.com", password: "a-long-secret-password", role: "tenant", formKey: body.publicKey }
     });
     expect(created.statusCode).toBe(201);
     const login = await app.inject({

@@ -14,8 +14,8 @@ async function main() {
       console.log(`Admin ${email} already exists; no changes made.`);
       return;
     }
-    await store.createAdmin(email, await hashPassword(password), "service", null);
-    console.log(`Created contact service admin: ${email}`);
+    await store.createAdmin(email, await hashPassword(password), "sudo", null);
+    console.log(`Created sudo admin: ${email}`);
     console.log("Change the seeded password after the first login.");
   } finally {
     await store.close();

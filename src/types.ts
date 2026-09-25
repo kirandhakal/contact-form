@@ -3,6 +3,36 @@ import type { JSONSchemaType } from "ajv";
 export type JsonObject = Record<string, unknown>;
 export type DestinationKind = "email" | "webhook";
 export type SubmissionStatus = "accepted" | "spam" | "deleted";
+export type AdminRole = "sudo" | "super" | "tenant";
+
+export interface TenantLimits {
+  maxOriginsPerForm: number;
+  maxForms: number;
+  maxTotalSubmissions: number;
+  maxDailySubmissions: number;
+}
+
+export interface TenantSummary extends TenantLimits {
+  id: string;
+  name: string;
+  formCount: number;
+  totalSubmissions: number;
+  dailySubmissions: number;
+}
+
+export interface TenantUsage extends TenantLimits {
+  formCount: number;
+  totalSubmissions: number;
+  dailySubmissions: number;
+}
+
+export interface AdminRecord {
+  id: string;
+  email: string;
+  passwordHash: string;
+  role: AdminRole;
+  tenantId: string | null;
+}
 
 export interface DestinationInput {
   kind: DestinationKind;
@@ -79,6 +109,8 @@ export interface FormSummary {
   spamCount: number;
   lastSubmittedAt?: string;
   sourceOriginCounts: Record<string, number>;
+  successMessage: string;
+  schema: JsonObject;
 }
 
 export interface OutboxJob {
@@ -108,11 +140,20 @@ export interface Store {
     submission: SubmissionRecord;
     allowedOrigins: string[];
   } | null>;
-  createAdmin(email: string, passwordHash: string, role: "service" | "site", tenantId: string | null): Promise<void>;
-  getAdminByEmail(email: string): Promise<{ id: string; email: string; passwordHash: string; role: "service" | "site"; tenantId: string | null } | null>;
+  createAdmin(email: string, passwordHash: string, role: AdminRole, tenantId: string | null): Promise<void>;
+  getAdminByEmail(email: string): Promise<AdminRecord | null>;
   createAdminSession(adminId: string, tokenHash: string, expiresAt: Date): Promise<void>;
-  getAdminBySession(tokenHash: string): Promise<{ id: string; email: string; role: "service" | "site"; tenantId: string | null } | null>;
+  getAdminBySession(tokenHash: string): Promise<Omit<AdminRecord, "passwordHash"> | null>;
   deleteAdminSession(tokenHash: string): Promise<void>;
+  updateAdminPassword(adminId: string, passwordHash: string): Promise<void>;
+  createTenant(name: string): Promise<string>;
+  listTenants(): Promise<TenantSummary[]>;
+  getTenantLimits(tenantId: string): Promise<TenantUsage | null>;
+  updateTenantLimits(tenantId: string, limits: TenantLimits): Promise<boolean>;
+  getForm(publicKey: string): Promise<FormRecord | null>;
+  updateForm(publicKey: string, input: Partial<Pick<CreateFormInput, "name" | "allowedOrigins" | "successMessage" | "schema">> & { status?: "active" | "disabled" }): Promise<FormRecord | null>;
+  updateSubmission(submissionId: string, payload: JsonObject, status: SubmissionStatus): Promise<boolean>;
+  getTenantIdForSubmission(submissionId: string): Promise<string | null>;
   getTenantIdForForm(publicKey: string): Promise<string | null>;
   setFormStatus(publicKey: string, status: "active" | "disabled"): Promise<boolean>;
   listSubmissions(publicKey: string, limit: number): Promise<SubmissionRecord[]>;
