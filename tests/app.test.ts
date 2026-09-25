@@ -201,6 +201,37 @@ async function createTestForm(store: MemoryStore) {
 }
 
 describe("contact form API", () => {
+  it("normalizes trailing slashes in allowed origins but rejects URL paths", async () => {
+    const store = new MemoryStore();
+    const app = buildApp(config, store);
+    const valid = await app.inject({
+      method: "POST",
+      url: "/v1/admin/forms",
+      headers: { authorization: `Bearer ${config.ADMIN_API_KEY}` },
+      payload: {
+        tenantName: "Local Studio",
+        name: "Local contact",
+        allowedOrigins: ["http://192.168.1.77:3000/"],
+        schema: { type: "object", additionalProperties: false, properties: {} }
+      }
+    });
+    expect(valid.statusCode).toBe(201);
+    expect(store.forms.get(valid.json().publicKey)?.allowedOrigins).toEqual(["http://192.168.1.77:3000"]);
+
+    const invalid = await app.inject({
+      method: "POST",
+      url: "/v1/admin/forms",
+      headers: { authorization: `Bearer ${config.ADMIN_API_KEY}` },
+      payload: {
+        tenantName: "Local Studio",
+        name: "Invalid contact",
+        allowedOrigins: ["http://192.168.1.77:3000/contact"],
+        schema: { type: "object", additionalProperties: false, properties: {} }
+      }
+    });
+    expect(invalid.statusCode).toBe(422);
+  });
+
   it("signs up a customer workspace and lets its owner create forms", async () => {
     const store = new MemoryStore();
     const app = buildApp(config, store);

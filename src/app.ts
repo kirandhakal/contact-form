@@ -45,6 +45,17 @@ function firstHeader(value: string | string[] | undefined): string | undefined {
   return Array.isArray(value) ? value[0] : value;
 }
 
+function normalizeExactOrigin(value: string): string | null {
+  try {
+    const url = new URL(value.trim());
+    if (!["http:", "https:"].includes(url.protocol) || url.username || url.password ||
+      url.pathname !== "/" || url.search || url.hash) return null;
+    return url.origin;
+  } catch {
+    return null;
+  }
+}
+
 async function verifyTurnstile(secret: string, token: string | undefined, ip: string): Promise<boolean> {
   if (!secret) return true;
   if (!token) return false;
@@ -261,7 +272,14 @@ export function buildApp(config: AppConfig, store: Store) {
     const admin = await adminFor(request);
     if (!admin) return problem(reply, 401, "Unauthorized", "Sign in required.");
     if (admin.id !== "service-key" && !sameOrigin(request)) return problem(reply, 403, "Forbidden", "Invalid origin.");
-    if (!validateCreateForm(request.body)) {
+    const body = assertPlainObject(request.body) && Array.isArray(request.body.allowedOrigins)
+      ? {
+          ...request.body,
+          allowedOrigins: request.body.allowedOrigins.map((origin) =>
+            typeof origin === "string" ? normalizeExactOrigin(origin) ?? origin : origin)
+        }
+      : request.body;
+    if (!validateCreateForm(body)) {
       return problem(reply, 422, "Validation failed", "Form definition is invalid.", {
         errors: validationErrors(validateCreateForm.errors)
       });
@@ -269,8 +287,8 @@ export function buildApp(config: AppConfig, store: Store) {
     // Site admins may add forms, but only to the tenant attached to their
     // account. Never trust a tenant id supplied by a browser session.
     const input: CreateFormInput = admin.role === "site"
-      ? { ...(request.body as CreateFormInput), tenantId: admin.tenantId ?? undefined }
-      : request.body as CreateFormInput;
+      ? { ...(body as CreateFormInput), tenantId: admin.tenantId ?? undefined }
+      : body as CreateFormInput;
     for (const origin of input.allowedOrigins) {
       if (!isAllowedOrigin(origin, [origin])) {
         return problem(reply, 422, "Validation failed", "Allowed origins must be exact HTTP or HTTPS origins.");
