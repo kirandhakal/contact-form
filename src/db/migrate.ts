@@ -1,7 +1,7 @@
 import { readFile, readdir } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import pg from "pg";
+import pg from "../../node_modules/@types/pg/index.js";
 import { getConfig } from "../config.js";
 
 const { Client } = pg;

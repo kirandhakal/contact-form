@@ -1,4 +1,4 @@
-import pg from "pg";
+import pg from "../../node_modules/@types/pg/index.js";
 import type { ListQuery, PageResult } from "../management.js";
 import type {
   CreateFormInput,
