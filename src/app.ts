@@ -350,6 +350,19 @@ export function buildApp(config: AppConfig, store: Store) {
     return { forms: result.items, pagination: result.pagination };
   });
 
+  app.get("/v1/admin/submissions", async (request, reply) => {
+    const actor = await adminFor(request);
+    if (!actor) return problem(reply, 401, "Unauthorized", "Sign in required.");
+    const parsed = listQuery.safeParse(request.query);
+    if (!parsed.success || (parsed.data.status && !["accepted", "spam"].includes(parsed.data.status))) {
+      return problem(reply, 400, "Invalid filters", "Use valid pagination, dates, status, and form filters.");
+    }
+    if (actor.role === "tenant") parsed.data.tenantId = actor.tenantId!;
+    reply.header("Cache-Control", "no-store");
+    const result = await store.managementPage("submissions", parsed.data);
+    return { submissions: result.items, pagination: result.pagination };
+  });
+
   app.get("/v1/admin/analytics", async (request, reply) => {
     const actor = await adminFor(request);
     if (!actor) return problem(reply, 401, "Unauthorized", "Sign in required.");
